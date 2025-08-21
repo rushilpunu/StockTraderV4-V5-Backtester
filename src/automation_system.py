@@ -119,8 +119,12 @@ class AutomationSystem:
         # Performance logging
         schedule.every().hour.do(self._schedule_performance_logging)
     
-    async def start(self):
-        """Start the automation system."""
+    async def start(self, run_once: bool = False):
+        """Start the automation system.
+        
+        Args:
+            run_once: If True, run a single analysis cycle and exit.
+        """
         logger.info("Starting automation system...")
         
         try:
@@ -141,7 +145,19 @@ class AutomationSystem:
             self.status.system_health = "healthy"
             
             logger.info("Automation system started successfully")
+
+            # Kick off an immediate analysis cycle so users don't wait for the first schedule interval
+            try:
+                await self._run_analysis_cycle()
+            except Exception as e:
+                logger.error(f"Immediate analysis cycle failed: {e}")
+                self._handle_error(str(e))
             
+            # If run-once mode is enabled, exit after the immediate cycle
+            if run_once:
+                logger.info("Run-once mode enabled - exiting after single analysis cycle")
+                return True
+
             # Start the main loop
             await self._run_automation_loop()
             
@@ -232,18 +248,18 @@ class AutomationSystem:
         logger.info(f"Starting analysis cycle #{cycle_id}")
         
         try:
-            # Check if market is open
+            # Check market hours but continue analysis to allow aggressive mode
             market_hours = await self.alpaca_client.get_market_hours()
             if not market_hours.get("is_open", False):
-                logger.info("Market is closed - skipping analysis cycle")
-                cycle.success = True
-                cycle.end_time = datetime.utcnow()
-                cycle.duration_seconds = (cycle.end_time - cycle.start_time).total_seconds()
-                self._complete_cycle(cycle)
-                return
+                logger.info("Market is closed - continuing analysis in aggressive mode")
             
             # Process each ticker
             for ticker in config.stock_tickers:
+                # Skip very short tickers that GDELT will reject
+                if len(ticker) < 3:
+                    logger.info(f"Skipping {ticker} - ticker too short for GDELT API")
+                    continue
+                    
                 try:
                     await self._process_ticker(ticker, cycle)
                     cycle.tickers_processed += 1
@@ -257,8 +273,29 @@ class AutomationSystem:
             # Update portfolio positions
             await self._update_portfolio_positions()
             
-            # Check for trade execution opportunities
+            # Check for trade execution opportunities (immediately process fresh alerts first)
             await self._process_pending_alerts()
+            
+            # Immediate exit enforcement within the cycle (useful for --once and tighter loops)
+            try:
+                await self._update_portfolio_positions()
+                await self._refresh_position_prices()
+                await self._enforce_position_exits()
+                await self._enforce_exits_by_pnl()
+            except Exception as e:
+                logger.error(f"In-cycle exit enforcement failed: {e}")
+
+            # Aggressive mode: ensure minimum trades per cycle
+            try:
+                if (config.aggressive_mode_enabled and self.current_cycle and 
+                    self.current_cycle.trades_executed < max(0, config.min_trades_per_cycle)):
+                    logger.info(
+                        f"Aggressive mode active. Trades this cycle: {self.current_cycle.trades_executed}. "
+                        f"Target minimum: {config.min_trades_per_cycle}. Forcing a trade."
+                    )
+                    await self._force_trade_for_cycle()
+            except Exception as e:
+                logger.error(f"Aggressive mode force-trade failed: {e}")
             
             cycle.success = len(cycle.errors) < len(config.stock_tickers) / 2
             
@@ -279,12 +316,241 @@ class AutomationSystem:
                 f"({cycle.tickers_processed} tickers, {cycle.alerts_generated} alerts, "
                 f"{cycle.trades_executed} trades)"
             )
+
+    async def _force_trade_for_cycle(self):
+        """Place at least one small trade when aggressive mode is enabled and no trades were executed."""
+        # Build ranked candidate list: (ticker, action, score, alert_obj_or_None)
+        alerts = self.alert_system.get_active_alerts()
+        candidates: List[tuple] = []
+
+        def is_at_max_position(ticker: str) -> bool:
+            if ticker in self.trading_engine.positions:
+                pos = self.trading_engine.positions[ticker]
+                max_val = self.trading_engine.portfolio_value * self.trading_engine.max_single_position
+                return abs(pos.market_value) >= max_val
+            return False
+
+        # 1) Alerts by confidence
+        if config.aggressive_prefer_alerts and alerts:
+            normalized_alerts: List[TradingAlert] = []
+            for a in alerts:
+                if a.processed:
+                    continue
+                if a.recommended_action == "monitor":
+                    try:
+                        sig = a.source_data.get("volatility_signal", {}) if a.source_data else {}
+                        direction = sig.get("direction")
+                        if direction == "bullish":
+                            a.recommended_action = "buy"
+                        elif direction == "bearish":
+                            a.recommended_action = "sell"
+                    except Exception:
+                        pass
+                if a.recommended_action in ("buy", "sell") and len(a.ticker) >= 3:
+                    score = a.confidence + 0.1 * a.volatility_score + 0.01 * min(a.article_count, 50)
+                    candidates.append((a.ticker, a.recommended_action, score, a))
+
+        # 2) Data-driven ranking (relevance + sentiment confidence)
+        for t in config.stock_tickers:
+            if len(t) < 3:
+                continue
+            history = self.data_processor.historical_data.get(t, [])
+            if not history:
+                continue
+            last = history[-1]
+            conf = (last.sentiment_metrics.confidence_score if last.sentiment_metrics else 0.0)
+            relevance = getattr(last, "relevance_score", 0.0)
+            score = 0.6 * relevance + 0.4 * conf
+            if last.sentiment_metrics:
+                if last.sentiment_metrics.sentiment_change != 0:
+                    action = "buy" if last.sentiment_metrics.sentiment_change > 0 else "sell"
+                else:
+                    action = "buy" if last.sentiment_metrics.average_sentiment >= 0 else "sell"
+            else:
+                action = "buy"
+            candidates.append((t, action, score, None))
+
+        # Deduplicate by ticker keeping highest score
+        best_by_ticker: Dict[str, tuple] = {}
+        for t, action, score, aobj in candidates:
+            if t not in best_by_ticker or score > best_by_ticker[t][2]:
+                best_by_ticker[t] = (t, action, score, aobj)
+        ranked = list(best_by_ticker.values())
+        # Filter out tickers already at max position to diversify
+        ranked = [c for c in ranked if not is_at_max_position(c[0])]
+        # Sort by score desc; break ties by least recently traded
+        ranked.sort(key=lambda x: (x[2], -(self.trading_engine.last_trade_time.get(x[0]).timestamp() if self.trading_engine.last_trade_time.get(x[0]) else 0)), reverse=True)
+
+        selected_ticker: Optional[str] = None
+        fallback_action: str = "buy"
+        alert_obj = None
+
+        # Try candidates with full engine evaluation; pick the first that passes
+        for t, act, _score, aobj in ranked:
+            try:
+                price_try = await self.alpaca_client.get_current_price(t)
+                if not price_try:
+                    continue
+                use_alert = aobj
+                if not use_alert:
+                    # create synthetic alert for evaluation
+                    from .alert_system import AlertLevel, AlertType, TradingAlert
+                    import hashlib
+                    aid = hashlib.md5(f"{t}_{int(datetime.utcnow().timestamp())}".encode()).hexdigest()[:12]
+                    use_alert = TradingAlert(
+                        alert_id=aid,
+                        ticker=t,
+                        alert_type=AlertType.TRADING_OPPORTUNITY,
+                        alert_level=AlertLevel.MEDIUM,
+                        title=f"Aggressive Candidate - {t}",
+                        description="Synthetic alert for aggressive selection",
+                        timestamp=datetime.utcnow(),
+                        expires_at=datetime.utcnow() + timedelta(minutes=10),
+                        sentiment_score=0.0,
+                        sentiment_change=0.0,
+                        volatility_score=0.5,
+                        confidence=max(0.5, float(config.aggressive_confidence)),
+                        article_count=0,
+                        top_headlines=[],
+                        key_themes=[],
+                        recommended_action=act,
+                        position_size_recommendation=float(config.aggressive_min_trade_value),
+                        stop_loss_suggestion=config.stop_loss_percentage,
+                        take_profit_suggestion=config.take_profit_percentage,
+                        source_data={}
+                    )
+                decision_try = await self.trading_engine.evaluate_trading_decision(use_alert, price_try)
+                if decision_try:
+                    selected_ticker, fallback_action, alert_obj = t, act, use_alert
+                    current_price = price_try
+                    decision = decision_try
+                    # Execute immediately
+                    order_id = await self.alpaca_client.execute_trading_decision(decision)
+                    if order_id:
+                        logger.info(f"Aggressive mode trade executed for {selected_ticker}: {order_id}")
+                        self.trading_engine.update_position(
+                            decision.ticker,
+                            decision.quantity,
+                            current_price,
+                            decision.action,
+                            stop_loss=decision.stop_loss,
+                            take_profit=decision.take_profit
+                        )
+                        if self.current_cycle:
+                            self.current_cycle.trades_executed += 1
+                        return
+            except Exception:
+                continue
+
+        # If we get here, no candidate passed engine checks. Force minimal trade on the top-ranked viable ticker.
+        if ranked:
+            selected_ticker, fallback_action, _score, alert_obj = ranked[0]
+        else:
+            # Final fallback: first eligible ticker
+            for t in config.stock_tickers:
+                if len(t) >= 3 and not is_at_max_position(t):
+                    selected_ticker = t
+                    fallback_action = "buy"
+                    break
+        
+        if not selected_ticker:
+            logger.warning("Aggressive mode: no suitable ticker found for forced trade")
+            return
+        
+        # Fetch current price
+        current_price = await self.alpaca_client.get_current_price(selected_ticker)
+        if not current_price:
+            logger.warning(f"Aggressive mode: unable to fetch price for {selected_ticker}")
+            return
+        
+        # Compute minimal quantity based on configured min trade value
+        min_value = max(1.0, float(config.aggressive_min_trade_value))
+        quantity = max(1, int(min_value // max(0.01, current_price)))
+        
+        # If quantity is still 0 due to high price, buy 1 share
+        if quantity <= 0:
+            quantity = 1
+        
+        # Build a lightweight synthetic alert if none chosen
+        from .alert_system import AlertLevel, AlertType, TradingAlert
+        from .trading_engine import TradeAction, OrderType, TradingDecision
+        from datetime import datetime, timedelta
+        import hashlib
+        
+        if not alert_obj:
+            aid = hashlib.md5(f"{selected_ticker}_{int(datetime.utcnow().timestamp())}".encode()).hexdigest()[:12]
+            alert_obj = TradingAlert(
+                alert_id=aid,
+                ticker=selected_ticker,
+                alert_type=AlertType.TRADING_OPPORTUNITY,
+                alert_level=AlertLevel.MEDIUM,
+                title=f"Aggressive Mode Trade - {selected_ticker}",
+                description="Forcing a minimal trade to satisfy aggressive mode.",
+                timestamp=datetime.utcnow(),
+                expires_at=datetime.utcnow() + timedelta(minutes=10),
+                sentiment_score=0.0,
+                sentiment_change=0.0,
+                volatility_score=0.6,
+                confidence=max(0.5, config.aggressive_confidence),
+                article_count=0,
+                top_headlines=[],
+                key_themes=[],
+                recommended_action=fallback_action,
+                position_size_recommendation=float(config.aggressive_min_trade_value),
+                stop_loss_suggestion=config.stop_loss_percentage,
+                take_profit_suggestion=config.take_profit_percentage,
+                source_data={}
+            )
+        
+        # Evaluate trading decision using engine for consistency/risk levels
+        decision = await self.trading_engine.evaluate_trading_decision(alert_obj, current_price)
+        
+        if not decision:
+            # Construct a minimal market order decision bypassing some conservatism
+            action_enum = TradeAction.BUY if fallback_action == "buy" else TradeAction.SELL
+            stop_loss = current_price * (1 - config.stop_loss_percentage) if action_enum == TradeAction.BUY else current_price * (1 + config.stop_loss_percentage)
+            take_profit = current_price * (1 + config.take_profit_percentage) if action_enum == TradeAction.BUY else current_price * (1 - config.take_profit_percentage)
+            decision = TradingDecision(
+                ticker=selected_ticker,
+                action=action_enum,
+                quantity=quantity,
+                order_type=OrderType.MARKET,
+                price=current_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                confidence=max(0.5, alert_obj.confidence),
+                reasoning="Aggressive mode forced trade to meet minimum trades per cycle",
+                risk_score=0.5,
+                expected_return=0.0,
+                max_risk=quantity * current_price * config.stop_loss_percentage,
+                alert_id=alert_obj.alert_id,
+                signal_strength=alert_obj.volatility_score,
+                sentiment_score=alert_obj.sentiment_score,
+                decision_time=datetime.utcnow(),
+                valid_until=datetime.utcnow() + timedelta(minutes=10)
+            )
+        
+        # Execute the trade
+        order_id = await self.alpaca_client.execute_trading_decision(decision)
+        if order_id:
+            logger.info(f"Aggressive mode trade executed for {selected_ticker}: {order_id}")
+            self.trading_engine.update_position(
+                decision.ticker,
+                decision.quantity,
+                current_price,
+                decision.action,
+                stop_loss=decision.stop_loss,
+                take_profit=decision.take_profit
+            )
+            if self.current_cycle:
+                self.current_cycle.trades_executed += 1
     
     async def _process_ticker(self, ticker: str, cycle: CycleMetrics):
         """Process a single ticker through the complete pipeline."""
         
-        # Get company name for the ticker (simplified mapping)
+        # Get company name for the ticker (comprehensive mapping)
         company_names = {
+            # Tech Giants
             "AAPL": "Apple Inc",
             "MSFT": "Microsoft Corporation", 
             "GOOGL": "Alphabet Inc",
@@ -294,7 +560,106 @@ class AutomationSystem:
             "NVDA": "NVIDIA Corporation",
             "NFLX": "Netflix Inc",
             "BABA": "Alibaba Group",
-            "V": "Visa Inc"
+            "V": "Visa Inc",
+            # Additional Tech
+            "ADBE": "Adobe Inc",
+            "CRM": "Salesforce Inc",
+            "ORCL": "Oracle Corporation",
+            "INTC": "Intel Corporation",
+            "AMD": "Advanced Micro Devices",
+            "QCOM": "Qualcomm Inc",
+            "AVGO": "Broadcom Inc",
+            "TXN": "Texas Instruments",
+            "MU": "Micron Technology",
+            "KLAC": "KLA Corporation",
+            # Financial Services
+            "JPM": "JPMorgan Chase",
+            "BAC": "Bank of America",
+            "WFC": "Wells Fargo",
+            "GS": "Goldman Sachs",
+            "MS": "Morgan Stanley",
+            "C": "Citigroup",
+            "USB": "US Bancorp",
+            "PNC": "PNC Financial",
+            "TFC": "Truist Financial",
+            "COF": "Capital One",
+            # Healthcare
+            "JNJ": "Johnson & Johnson",
+            "PFE": "Pfizer Inc",
+            "UNH": "UnitedHealth Group",
+            "ABBV": "AbbVie Inc",
+            "TMO": "Thermo Fisher Scientific",
+            "DHR": "Danaher Corporation",
+            "LLY": "Eli Lilly",
+            "MRK": "Merck & Co",
+            "BMY": "Bristol Myers Squibb",
+            "AMGN": "Amgen Inc",
+            # Consumer
+            "PG": "Procter & Gamble",
+            "KO": "Coca-Cola Company",
+            "PEP": "PepsiCo Inc",
+            "WMT": "Walmart Inc",
+            "HD": "Home Depot",
+            "MCD": "McDonald's Corporation",
+            "SBUX": "Starbucks Corporation",
+            "NKE": "Nike Inc",
+            "DIS": "Walt Disney Company",
+            "CMCSA": "Comcast Corporation",
+            # Energy
+            "XOM": "Exxon Mobil",
+            "CVX": "Chevron Corporation",
+            "COP": "ConocoPhillips",
+            "EOG": "EOG Resources",
+            "SLB": "Schlumberger",
+            "PSX": "Phillips 66",
+            "VLO": "Valero Energy",
+            "MPC": "Marathon Petroleum",
+            "OXY": "Occidental Petroleum",
+            "KMI": "Kinder Morgan",
+            # Industrial
+            "CAT": "Caterpillar Inc",
+            "BA": "Boeing Company",
+            "MMM": "3M Company",
+            "GE": "General Electric",
+            "HON": "Honeywell International",
+            "UPS": "United Parcel Service",
+            "FDX": "FedEx Corporation",
+            "LMT": "Lockheed Martin",
+            "RTX": "Raytheon Technologies",
+            "DE": "Deere & Company",
+            # Communication
+            "T": "AT&T Inc",
+            "VZ": "Verizon Communications",
+            "TMUS": "T-Mobile US",
+            "CHTR": "Charter Communications",
+            "CME": "CME Group",
+            "ICE": "Intercontinental Exchange",
+            "SPGI": "S&P Global",
+            "MCO": "Moody's Corporation",
+            "BLK": "BlackRock Inc",
+            "SCHW": "Charles Schwab",
+            # Real Estate
+            "PLD": "Prologis Inc",
+            "AMT": "American Tower",
+            "CCI": "Crown Castle",
+            "EQIX": "Equinix Inc",
+            "DLR": "Digital Realty Trust",
+            "PSA": "Public Storage",
+            "SPG": "Simon Property Group",
+            "O": "Realty Income",
+            "AVB": "AvalonBay Communities",
+            "EQR": "Equity Residential",
+            # Materials
+            "LIN": "Linde PLC",
+            "APD": "Air Products",
+            "FCX": "Freeport-McMoRan",
+            "NEM": "Newmont Corporation",
+            "DOW": "Dow Inc",
+            "DD": "DuPont de Nemours",
+            "NUE": "Nucor Corporation",
+            "X": "United States Steel",
+            "BLL": "Ball Corporation",
+            "ALB": "Albemarle Corporation"
         }
         
         company_name = company_names.get(ticker, ticker)
@@ -332,7 +697,22 @@ class AutomationSystem:
         active_alerts = self.alert_system.get_active_alerts()
         
         for alert in active_alerts:
-            if alert.processed or alert.recommended_action == "hold":
+            if alert.processed:
+                continue
+            
+            # Convert non-actionable 'monitor' into a directional action when possible
+            if alert.recommended_action == "monitor":
+                try:
+                    sig = alert.source_data.get("volatility_signal", {}) if alert.source_data else {}
+                    direction = sig.get("direction")
+                    if direction == "bullish":
+                        alert.recommended_action = "buy"
+                    elif direction == "bearish":
+                        alert.recommended_action = "sell"
+                except Exception:
+                    pass
+            
+            if alert.recommended_action == "hold":
                 continue
             
             try:
@@ -359,7 +739,9 @@ class AutomationSystem:
                             decision.ticker,
                             decision.quantity,
                             current_price,
-                            decision.action
+                            decision.action,
+                            stop_loss=decision.stop_loss,
+                            take_profit=decision.take_profit
                         )
                         
                         if self.current_cycle:
@@ -373,27 +755,42 @@ class AutomationSystem:
                 continue
     
     async def _update_portfolio_positions(self):
-        """Update portfolio positions from Alpaca."""
+        """Update portfolio positions from Alpaca, merging to preserve SL/TP."""
         try:
             positions = await self.alpaca_client.get_positions()
             
-            # Update trading engine with current positions
-            for position in positions:
-                self.trading_engine.positions[position.ticker] = position
+            # Update trading engine with current positions (merge)
+            from .trading_engine import Position as EnginePosition
+            updated_tickers: set = set()
+            for p in positions:
+                updated_tickers.add(p.ticker)
+                if p.ticker in self.trading_engine.positions:
+                    ep = self.trading_engine.positions[p.ticker]
+                    ep.quantity = p.quantity
+                    ep.current_price = p.current_price
+                    if not ep.entry_price:
+                        ep.entry_price = p.cost_basis / max(p.quantity, 1) if p.quantity else 0.0
+                else:
+                    self.trading_engine.positions[p.ticker] = EnginePosition(
+                        ticker=p.ticker,
+                        quantity=p.quantity,
+                        entry_price=p.cost_basis / max(p.quantity, 1) if p.quantity else 0.0,
+                        current_price=p.current_price,
+                        entry_time=datetime.utcnow(),
+                        stop_loss=None,
+                        take_profit=None
+                    )
+            # Remove positions not present in Alpaca
+            for ticker in list(self.trading_engine.positions.keys()):
+                if ticker not in updated_tickers:
+                    del self.trading_engine.positions[ticker]
             
             # Update status
             self.status.open_positions = len(positions)
             
         except Exception as e:
             logger.error(f"Error updating portfolio positions: {e}")
-    
-    def _schedule_portfolio_monitoring(self):
-        """Schedule portfolio monitoring."""
-        if not self.is_running:
-            return
-        
-        asyncio.create_task(self._monitor_portfolio())
-    
+
     async def _monitor_portfolio(self):
         """Monitor portfolio and update orders."""
         try:
@@ -408,12 +805,134 @@ class AutomationSystem:
                 self.status.daily_pnl = performance.get("total_unrealized_pnl", 0)
                 self.status.performance_metrics = performance
             
+            # Enforce exits when SL/TP hit (refresh latest prices first)
+            await self._refresh_position_prices()
+            await self._enforce_position_exits()
+            # Also enforce exits based on broker PnL percentages
+            await self._enforce_exits_by_pnl()
+            
             # Check for risk management triggers
             if self.trading_engine.should_halt_trading():
                 logger.warning("Risk management triggered - halting trading")
             
         except Exception as e:
             logger.error(f"Error monitoring portfolio: {e}")
+
+    async def _enforce_position_exits(self):
+        """Close positions when take-profit or stop-loss thresholds are reached."""
+        try:
+            tp_pct = float(config.take_profit_percentage)
+            sl_pct = float(config.stop_loss_percentage)
+            for ticker, pos in list(self.trading_engine.positions.items()):
+                if pos.quantity == 0 or pos.entry_price == 0:
+                    continue
+                current_price = pos.current_price
+                entry_price = pos.entry_price
+                is_long = pos.quantity > 0
+                # Compute thresholds
+                use_config = bool(config.enforce_config_exits)
+                sl_price = (
+                    entry_price * (1 - sl_pct) if is_long else entry_price * (1 + sl_pct)
+                ) if (use_config or not pos.stop_loss) else pos.stop_loss
+                tp_price = (
+                    entry_price * (1 + tp_pct) if is_long else entry_price * (1 - tp_pct)
+                ) if (use_config or not pos.take_profit) else pos.take_profit
+                hit_tp = current_price >= tp_price if is_long else current_price <= tp_price
+                hit_sl = current_price <= sl_price if is_long else current_price >= sl_price
+                if hit_tp or hit_sl:
+                    reason = "take-profit" if hit_tp else "stop-loss"
+                    logger.info(
+                        f"{reason.title()} reached for {ticker} at {current_price:.4f} (entry {entry_price:.4f}, "
+                        f"tp={tp_price:.4f}, sl={sl_price:.4f}, long={is_long}). Closing position."
+                    )
+                    try:
+                        await self.alpaca_client._cancel_open_orders_for_symbol(ticker)
+                    except Exception:
+                        pass
+                    await self.alpaca_client.close_position(ticker, percentage=1.0)
+                    # Remove from engine after close; PnL captured by broker
+                    if ticker in self.trading_engine.positions:
+                        del self.trading_engine.positions[ticker]
+        except Exception as e:
+            logger.error(f"Error enforcing position exits: {e}")
+
+    async def _enforce_exits_by_pnl(self):
+        """Close positions using Alpaca's unrealized P&L percentage (plpc)."""
+        try:
+            tp_pct = float(config.take_profit_percentage)
+            sl_pct = float(config.stop_loss_percentage)
+            logger.info(f"Checking P&L exits: TP={tp_pct:.4f}, SL={sl_pct:.4f}")
+            
+            positions = await self.alpaca_client.get_positions()
+            logger.info(f"Found {len(positions)} positions to check for P&L exits")
+            
+            for p in positions:
+                # unrealized_pnl_percent stored as percent (e.g., 1.0 for 1%)
+                plpc = (p.unrealized_pnl_percent / 100.0) if p.unrealized_pnl_percent is not None else 0.0
+                qty = int(p.quantity)
+                if qty == 0:
+                    continue
+                
+                # For long positions: positive plpc is profit, negative is loss
+                # For short positions: negative plpc is profit, positive is loss
+                is_long = qty > 0
+                
+                # Check if we should exit based on P&L
+                should_exit = False
+                reason = ""
+                
+                if is_long:
+                    # Long position: exit if profit >= tp_pct OR loss <= -sl_pct
+                    if plpc >= tp_pct:
+                        should_exit = True
+                        reason = "TP"
+                    elif plpc <= -sl_pct:
+                        should_exit = True
+                        reason = "SL"
+                else:
+                    # Short position: exit if profit >= tp_pct OR loss <= -sl_pct
+                    if plpc <= -tp_pct:
+                        should_exit = True
+                        reason = "TP"
+                    elif plpc >= sl_pct:
+                        should_exit = True
+                        reason = "SL"
+                
+                if should_exit:
+                    logger.info(
+                        f"PnL exit {reason} for {p.ticker}: plpc={plpc:.4f}, tp={tp_pct:.4f}, sl={sl_pct:.4f}, long={is_long}. Closing position."
+                    )
+                    try:
+                        await self.alpaca_client._cancel_open_orders_for_symbol(p.ticker)
+                    except Exception:
+                        pass
+                    await self.alpaca_client.close_position(p.ticker, percentage=1.0)
+                    if p.ticker in self.trading_engine.positions:
+                        del self.trading_engine.positions[p.ticker]
+                else:
+                    # Debug logging to see what's happening
+                    logger.debug(
+                        f"PnL check for {p.ticker}: plpc={plpc:.4f}, tp={tp_pct:.4f}, sl={sl_pct:.4f}, long={is_long}, should_exit={should_exit}"
+                    )
+        except Exception as e:
+            logger.error(f"Error enforcing P&L exits: {e}")
+
+    async def _refresh_position_prices(self):
+        """Refresh engine position prices from Alpaca quotes."""
+        try:
+            for ticker, pos in self.trading_engine.positions.items():
+                latest = await self.alpaca_client.get_current_price(ticker)
+                if latest:
+                    pos.current_price = latest
+        except Exception as e:
+            logger.warning(f"Price refresh failed: {e}")
+    
+    def _schedule_portfolio_monitoring(self):
+        """Schedule portfolio monitoring."""
+        if not self.is_running:
+            return
+        
+        asyncio.create_task(self._monitor_portfolio())
     
     def _schedule_health_check(self):
         """Schedule system health check."""
@@ -460,18 +979,18 @@ class AutomationSystem:
     async def _check_gdelt_api_health(self) -> Dict[str, Any]:
         """Check GDELT API health."""
         try:
-            # Simple test query
-            test_data = await self.gdelt_client.get_doc_search(
-                query="test",
-                start_date=datetime.utcnow() - timedelta(hours=1),
-                end_date=datetime.utcnow(),
-                max_records=1
+            # Use adaptive news fetch logic for a representative ticker
+            test_data = await self.gdelt_client.get_stock_related_news(
+                ticker="AAPL",
+                company_name="Apple Inc",
+                hours_back=2
             )
-            
-            if "articles" in test_data:
-                return {"status": "healthy", "message": "GDELT API responding"}
+
+            num_articles = len(test_data.get("articles", [])) if isinstance(test_data, dict) else 0
+            if num_articles > 0:
+                return {"status": "healthy", "message": f"GDELT API responding ({num_articles} articles)"}
             else:
-                return {"status": "warning", "message": "GDELT API response unexpected"}
+                return {"status": "error", "message": "GDELT API returned 0 articles for test query"}
                 
         except Exception as e:
             return {"status": "error", "message": f"GDELT API error: {str(e)}"}

@@ -43,7 +43,7 @@ class TradingSystemManager:
         self.automation_system: Optional[AutomationSystem] = None
         self.shutdown_requested = False
     
-    async def start(self, dry_run: bool = False):
+    async def start(self, dry_run: bool = False, run_once: bool = False):
         """Start the trading system."""
         try:
             with LoggedOperation("system_startup", "main"):
@@ -69,11 +69,11 @@ class TradingSystemManager:
                     config.trading_enabled = False
                     
                     try:
-                        await self.automation_system.start()
+                        await self.automation_system.start(run_once=run_once)
                     finally:
                         config.trading_enabled = original_trading_enabled
                 else:
-                    await self.automation_system.start()
+                    await self.automation_system.start(run_once=run_once)
                 
         except KeyboardInterrupt:
             logger.info("Shutdown requested by user")
@@ -129,6 +129,7 @@ class TradingSystemManager:
         logger.info(f"  • Stop Loss: {config.stop_loss_percentage:.1%}")
         logger.info(f"  • Take Profit: {config.take_profit_percentage:.1%}")
         logger.info(f"  • Log Level: {config.log_level}")
+        logger.info(f"  • Aggressive Mode: {config.aggressive_mode_enabled} (min trades/cycle: {config.min_trades_per_cycle}, min trade $: {config.aggressive_min_trade_value})")
         
         if dry_run:
             logger.info("  • Mode: DRY RUN (no actual trades)")
@@ -209,8 +210,12 @@ TRADING_ENABLED=true
     return False
 
 
-async def run_system_check():
-    """Run comprehensive system check."""
+async def run_system_check(strict_gdelt: bool = False):
+    """Run comprehensive system check.
+    
+    Args:
+        strict_gdelt: If True, the check fails when GDELT returns zero articles.
+    """
     logger.info("🔍 Running system check...")
     
     try:
@@ -225,17 +230,34 @@ async def run_system_check():
         # Test GDELT client
         logger.info("  • Testing GDELT API connection...")
         async with GDELTClient() as gdelt_client:
-            from datetime import datetime, timedelta
-            test_data = await gdelt_client.get_doc_search(
-                query="AAPL",
-                start_date=datetime.utcnow() - timedelta(hours=1),
-                end_date=datetime.utcnow(),
-                max_records=1
+            # First test basic connectivity
+            logger.info("    • Testing basic GDELT connectivity...")
+            connection_test = await gdelt_client.test_connection()
+            if connection_test.get("status") == "error":
+                logger.error(f"    ❌ GDELT basic connectivity failed: {connection_test.get('message')}")
+                if strict_gdelt:
+                    return False
+                else:
+                    logger.warning("    ⚠️  GDELT basic connectivity failed, continuing...")
+            
+            # Now test actual news retrieval
+            logger.info("    • Testing GDELT news retrieval...")
+            test_data = await gdelt_client.get_stock_related_news(
+                ticker="AAPL",
+                company_name="Apple Inc",
+                hours_back=2
             )
-            if test_data:
-                logger.info("    ✅ GDELT API connection successful")
+            gdelt_articles = len(test_data.get("articles", [])) if isinstance(test_data, dict) else 0
+            if gdelt_articles > 0:
+                logger.info(f"    ✅ GDELT API connection successful ({gdelt_articles} articles)")
+                gdelt_ok = True
             else:
-                logger.warning("    ⚠️  GDELT API returned no data")
+                gdelt_ok = False
+                msg = "    ❌ GDELT API returned 0 articles for test query"
+                if strict_gdelt:
+                    logger.error(msg)
+                else:
+                    logger.warning(msg)
         
         # Test Alpaca client
         logger.info("  • Testing Alpaca API connection...")
@@ -244,9 +266,10 @@ async def run_system_check():
         if account_info:
             logger.info("    ✅ Alpaca API connection successful")
             logger.info(f"    Portfolio Value: ${account_info.get('portfolio_value', 0):.2f}")
+            alpaca_ok = True
         else:
             logger.error("    ❌ Alpaca API connection failed")
-            return False
+            alpaca_ok = False
         
         # Test other components
         logger.info("  • Testing data processing components...")
@@ -257,8 +280,12 @@ async def run_system_check():
         
         logger.info("    ✅ All components initialized successfully")
         
-        logger.info("✅ System check completed successfully")
-        return True
+        overall_ok = alpaca_ok and (gdelt_ok if strict_gdelt else True)
+        if overall_ok:
+            logger.info("✅ System check completed successfully")
+        else:
+            logger.error("❌ System check failed due to one or more components")
+        return overall_ok
         
     except Exception as e:
         error_id = error_handler.handle_exception(e, "system_check", critical=True)
@@ -307,11 +334,23 @@ async def main():
         action="store_true",
         help="Run system check and exit"
     )
+
+    parser.add_argument(
+        "--strict-gdelt",
+        action="store_true",
+        help="Fail system check if GDELT returns zero articles"
+    )
     
     parser.add_argument(
         "--create-env",
         action="store_true",
         help="Create sample .env file and exit"
+    )
+
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run exactly one analysis cycle and exit"
     )
     
     args = parser.parse_args()
@@ -334,14 +373,14 @@ async def main():
     
     # Run system check if requested
     if args.check:
-        success = await run_system_check()
+        success = await run_system_check(strict_gdelt=args.strict_gdelt)
         sys.exit(0 if success else 1)
     
     # Start the main system
     system_manager = TradingSystemManager()
     
     try:
-        await system_manager.start(dry_run=args.dry_run)
+        await system_manager.start(dry_run=args.dry_run, run_once=args.once)
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
     except Exception as e:

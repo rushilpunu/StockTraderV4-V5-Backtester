@@ -11,6 +11,7 @@ try:
     from alpaca.trading.client import TradingClient
     from alpaca.trading.requests import (
         MarketOrderRequest, LimitOrderRequest, StopOrderRequest,
+        TakeProfitRequest, StopLossRequest,
         GetOrdersRequest, ClosePositionRequest
     )
     from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
@@ -79,8 +80,8 @@ class AlpacaPosition:
             quantity=int(position.qty) if position.qty is not None else 0,
             market_value=float(position.market_value) if position.market_value is not None else 0.0,
             cost_basis=float(position.cost_basis) if position.cost_basis is not None else 0.0,
-            unrealized_pnl=float(position.unrealized_pnl) if position.unrealized_pnl is not None else 0.0,
-            unrealized_pnl_percent=float(position.unrealized_plpc) * 100 if position.unrealized_plpc is not None else 0.0,
+            unrealized_pnl=float(position.unrealized_pl) if getattr(position, 'unrealized_pl', None) is not None else 0.0,
+            unrealized_pnl_percent=float(position.unrealized_plpc) * 100 if getattr(position, 'unrealized_plpc', None) is not None else 0.0,
             current_price=float(position.current_price) if position.current_price is not None else 0.0
         )
 
@@ -188,6 +189,11 @@ class AlpacaClient:
             return None
         
         try:
+            # Cancel any open orders for this ticker to avoid wash trade rejections
+            try:
+                await self._cancel_open_orders_for_symbol(decision.ticker)
+            except Exception as cleanup_err:
+                logger.warning(f"Pre-trade cleanup failed for {decision.ticker}: {cleanup_err}")
             # Get current price if not provided
             if not decision.price:
                 current_price = await self.get_current_price(decision.ticker)
@@ -203,13 +209,19 @@ class AlpacaClient:
             else:
                 side = OrderSide.SELL
             
-            # Create order request based on type
+            # Prepare bracket legs if provided
+            rounded_sl = round(decision.stop_loss, 2) if decision.stop_loss else None
+            rounded_tp = round(decision.take_profit, 2) if decision.take_profit else None
+
+            # Create order request based on type; include bracket legs in initial request
             if decision.order_type == EngineOrderType.MARKET:
                 order_request = MarketOrderRequest(
                     symbol=decision.ticker,
                     qty=decision.quantity,
                     side=side,
-                    time_in_force=TimeInForce.DAY
+                    time_in_force=TimeInForce.DAY,
+                    take_profit=(TakeProfitRequest(limit_price=rounded_tp) if rounded_tp else None),
+                    stop_loss=(StopLossRequest(stop_price=rounded_sl) if rounded_sl else None)
                 )
                 
             elif decision.order_type == EngineOrderType.LIMIT:
@@ -220,7 +232,9 @@ class AlpacaClient:
                     qty=decision.quantity,
                     side=side,
                     time_in_force=TimeInForce.DAY,
-                    limit_price=limit_price
+                    limit_price=limit_price,
+                    take_profit=(TakeProfitRequest(limit_price=rounded_tp) if rounded_tp else None),
+                    stop_loss=(StopLossRequest(stop_price=rounded_sl) if rounded_sl else None)
                 )
                 
             else:
@@ -240,14 +254,30 @@ class AlpacaClient:
                 f"(Order ID: {order_id})"
             )
             
-            # Submit stop loss and take profit orders if specified
-            await self._submit_bracket_orders(decision, order_id, current_price)
+            # If bracket legs were not provided up-front, attempt to submit them after
+            if not (rounded_sl or rounded_tp):
+                await self._submit_bracket_orders(decision, order_id, current_price)
             
             return order_id
             
         except Exception as e:
             logger.error(f"Error executing trading decision: {e}")
             return None
+
+    async def _cancel_open_orders_for_symbol(self, ticker: str):
+        """Cancel any open orders for a given symbol to prevent wash trade rejections."""
+        try:
+            request = GetOrdersRequest(status="open")
+            open_orders = self.trading_client.get_orders(request)
+            for order in open_orders:
+                if getattr(order, 'symbol', None) == ticker:
+                    try:
+                        self.trading_client.cancel_order_by_id(order.id)
+                        logger.info(f"Cancelled open order {order.id} for {ticker}")
+                    except Exception as ce:
+                        logger.warning(f"Failed to cancel order {order.id} for {ticker}: {ce}")
+        except Exception as e:
+            logger.warning(f"Could not fetch/cancel open orders for {ticker}: {e}")
     
     async def _submit_bracket_orders(
         self, 
@@ -272,36 +302,40 @@ class AlpacaClient:
             else:
                 bracket_side = OrderSide.BUY   # Close short position
             
+            # Round prices to valid increments (avoid sub-penny errors)
+            rounded_stop_loss = round(decision.stop_loss, 2) if decision.stop_loss else None
+            rounded_take_profit = round(decision.take_profit, 2) if decision.take_profit else None
+
             # Submit stop loss order
-            if decision.stop_loss:
+            if rounded_stop_loss:
                 try:
                     stop_order_request = StopOrderRequest(
                         symbol=decision.ticker,
                         qty=decision.quantity,
                         side=bracket_side,
                         time_in_force=TimeInForce.GTC,
-                        stop_price=decision.stop_loss
+                        stop_price=rounded_stop_loss
                     )
                     
                     stop_order = self.trading_client.submit_order(stop_order_request)
-                    logger.info(f"Stop loss order submitted: {stop_order.id} at ${decision.stop_loss}")
+                    logger.info(f"Stop loss order submitted: {stop_order.id} at ${rounded_stop_loss}")
                     
                 except Exception as e:
                     logger.error(f"Error submitting stop loss order: {e}")
             
             # Submit take profit order
-            if decision.take_profit:
+            if rounded_take_profit:
                 try:
                     profit_order_request = LimitOrderRequest(
                         symbol=decision.ticker,
                         qty=decision.quantity,
                         side=bracket_side,
                         time_in_force=TimeInForce.GTC,
-                        limit_price=decision.take_profit
+                        limit_price=rounded_take_profit
                     )
                     
                     profit_order = self.trading_client.submit_order(profit_order_request)
-                    logger.info(f"Take profit order submitted: {profit_order.id} at ${decision.take_profit}")
+                    logger.info(f"Take profit order submitted: {profit_order.id} at ${rounded_take_profit}")
                     
                 except Exception as e:
                     logger.error(f"Error submitting take profit order: {e}")
@@ -370,10 +404,23 @@ class AlpacaClient:
             Order ID if successful, None otherwise
         """
         try:
+            # Proactively cancel any open orders for this symbol before closing
+            try:
+                await self._cancel_open_orders_for_symbol(ticker)
+            except Exception:
+                pass
+
+            # Convert percentage to API expected string format (e.g., "100" for 1.0)
+            close_pct = percentage
+            if 0 < close_pct <= 1.0:
+                close_pct_str = str(int(round(close_pct * 100)))
+            else:
+                close_pct_str = str(int(round(close_pct)))
+
             if percentage == 1.0:
                 # Close entire position
                 close_request = ClosePositionRequest(
-                    percentage=percentage
+                    percentage=close_pct_str
                 )
                 order = self.trading_client.close_position(ticker, close_request)
             else:
@@ -399,12 +446,34 @@ class AlpacaClient:
             
             order_id = str(order.id)
             logger.info(f"Position close order submitted for {ticker}: {order_id}")
-            
             return order_id
             
         except Exception as e:
             logger.error(f"Error closing position for {ticker}: {e}")
-            return None
+            # Fallback: submit reverse market order for full quantity
+            try:
+                positions = self.trading_client.get_all_positions()
+                pos = next((p for p in positions if p.symbol == ticker), None)
+                if not pos:
+                    logger.warning(f"No live position found for {ticker} during fallback close")
+                    return None
+                qty = int(abs(float(pos.qty)))
+                if qty <= 0:
+                    return None
+                side = OrderSide.SELL if float(pos.qty) > 0 else OrderSide.BUY
+                order_request = MarketOrderRequest(
+                    symbol=ticker,
+                    qty=qty,
+                    side=side,
+                    time_in_force=TimeInForce.DAY
+                )
+                order = self.trading_client.submit_order(order_request)
+                order_id = str(order.id)
+                logger.info(f"Fallback reverse order submitted for {ticker}: {order_id}")
+                return order_id
+            except Exception as e2:
+                logger.error(f"Fallback close failed for {ticker}: {e2}")
+                return None
     
     @backoff.on_exception(
         backoff.expo,

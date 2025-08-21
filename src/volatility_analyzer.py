@@ -312,16 +312,21 @@ class VolatilityAnalyzer:
             if score > 0.5 and key != 'composite':
                 triggers.append(key.replace('_threshold', '').replace('_zscore', ''))
         
-        # Determine recommended action
-        if signal_type == 'high_volatility' and confidence > 0.6:
+        # Determine recommended action (more aggressive for medium/emerging)
+        if signal_type == 'high_volatility' and confidence > 0.55:
             if direction == 'bullish':
                 recommended_action = 'buy'
             elif direction == 'bearish':
                 recommended_action = 'sell'
             else:
                 recommended_action = 'hold'
-        elif signal_type in ['medium_volatility', 'emerging_volatility'] and confidence > 0.4:
-            recommended_action = 'monitor'
+        elif signal_type in ['medium_volatility', 'emerging_volatility'] and confidence > 0.5:
+            if direction == 'bullish':
+                recommended_action = 'buy'
+            elif direction == 'bearish':
+                recommended_action = 'sell'
+            else:
+                recommended_action = 'monitor'
         else:
             recommended_action = 'hold'
         

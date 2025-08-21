@@ -102,36 +102,36 @@ class AlertSystem:
         return {
             "sentiment_spike": {
                 "min_sentiment_change": config.sentiment_change_threshold,
+                "min_confidence": 0.3,
+                "min_articles": 2,
+                "cooldown_minutes": 10
+            },
+            "volatility_surge": {
+                "min_volatility_score": 0.5,
                 "min_confidence": 0.4,
                 "min_articles": 3,
                 "cooldown_minutes": 15
             },
-            "volatility_surge": {
-                "min_volatility_score": 0.6,
-                "min_confidence": 0.5,
-                "min_articles": 5,
-                "cooldown_minutes": 20
-            },
             "volume_anomaly": {
-                "min_article_count": config.event_count_threshold,
-                "volume_multiplier": 2.0,
-                "cooldown_minutes": 30
+                "min_article_count": max(3, config.event_count_threshold),
+                "volume_multiplier": 1.5,
+                "cooldown_minutes": 20
             },
             "high_sentiment": {
                 "sentiment_threshold": config.sentiment_threshold_high,
-                "min_confidence": 0.6,
-                "cooldown_minutes": 45
+                "min_confidence": 0.5,
+                "cooldown_minutes": 30
             },
             "low_sentiment": {
                 "sentiment_threshold": config.sentiment_threshold_low,
-                "min_confidence": 0.6,
-                "cooldown_minutes": 45
+                "min_confidence": 0.5,
+                "cooldown_minutes": 30
             },
             "trading_opportunity": {
-                "min_signal_strength": 0.7,
-                "min_confidence": 0.7,
+                "min_signal_strength": 0.5,
+                "min_confidence": 0.5,
                 "required_action": ["buy", "sell"],
-                "cooldown_minutes": 60
+                "cooldown_minutes": 20
             }
         }
     

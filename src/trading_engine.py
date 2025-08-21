@@ -197,7 +197,7 @@ class TradingEngine:
         )
         
         # Final risk assessment
-        if risk_score > 0.8:  # High risk threshold
+        if risk_score > 0.9:  # Make threshold more permissive
             logger.warning(f"Trade risk too high for {ticker}: {risk_score}")
             return None
         
@@ -252,11 +252,11 @@ class TradingEngine:
                 return False
         
         # Check alert confidence and level
-        if alert.confidence < 0.4:
+        if alert.confidence < 0.25:
             logger.info(f"Alert confidence too low: {alert.confidence}")
             return False
         
-        if alert.alert_level == AlertLevel.LOW:
+        if alert.alert_level == AlertLevel.LOW and alert.confidence < 0.5:
             logger.info("Alert level too low for trading")
             return False
         
@@ -347,7 +347,7 @@ class TradingEngine:
         position_size = int(position_size * confidence_multiplier)
         
         # Ensure minimum viable position
-        min_position_value = 100  # Minimum $100 position
+        min_position_value = 50  # Minimum $50 position (more aggressive)
         min_shares = max(1, int(min_position_value / current_price))
         
         return max(min_shares, position_size) if position_size > 0 else 0
@@ -390,11 +390,15 @@ class TradingEngine:
     def _determine_order_type(self, alert: TradingAlert, current_price: float) -> OrderType:
         """Determine the appropriate order type."""
         
-        # Use market orders for high-confidence, urgent signals
-        if (alert.alert_level in [AlertLevel.HIGH, AlertLevel.CRITICAL] and
-            alert.confidence > 0.7):
+        # Use market orders for higher-confidence, urgent signals (more aggressive)
+        if (alert.alert_level in [AlertLevel.MEDIUM, AlertLevel.HIGH, AlertLevel.CRITICAL] and
+            alert.confidence > 0.55):
             return OrderType.MARKET
         
+        # Allow market orders for LOW alerts with sufficient confidence
+        if (alert.alert_level == AlertLevel.LOW and alert.confidence > 0.6):
+            return OrderType.MARKET
+
         # Use limit orders for everything else
         return OrderType.LIMIT
     
@@ -496,46 +500,61 @@ class TradingEngine:
         ticker: str,
         quantity: int,
         price: float,
-        action: TradeAction
+        action: TradeAction,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None
     ):
         """Update position after trade execution."""
         
+        if action == TradeAction.CLOSE:
+            # Full close requested
+            if ticker in self.positions:
+                position = self.positions[ticker]
+                pnl = (price - position.entry_price) * position.quantity
+                self._record_trade_pnl(pnl)
+                del self.positions[ticker]
+            self.last_trade_time[ticker] = datetime.utcnow()
+            logger.info(f"Position closed for {ticker}")
+            return
+        
+        # Determine signed delta quantity based on action
+        delta_quantity = quantity if action == TradeAction.BUY else -quantity
+        
         if ticker not in self.positions:
-            if quantity != 0:
+            if delta_quantity != 0:
                 self.positions[ticker] = Position(
                     ticker=ticker,
-                    quantity=quantity,
+                    quantity=delta_quantity,
                     entry_price=price,
                     current_price=price,
                     entry_time=datetime.utcnow(),
-                    stop_loss=None,
-                    take_profit=None
+                    stop_loss=stop_loss,
+                    take_profit=take_profit
                 )
         else:
             position = self.positions[ticker]
             
-            if action == TradeAction.CLOSE:
-                # Close the position
+            # Update existing position
+            total_quantity = position.quantity + delta_quantity
+            if total_quantity == 0:
+                # Position closed
                 pnl = (price - position.entry_price) * position.quantity
                 self._record_trade_pnl(pnl)
                 del self.positions[ticker]
             else:
-                # Update existing position
-                total_quantity = position.quantity + quantity
-                if total_quantity == 0:
-                    # Position closed
-                    pnl = (price - position.entry_price) * position.quantity
-                    self._record_trade_pnl(pnl)
-                    del self.positions[ticker]
-                else:
-                    # Update position
-                    weighted_price = (
-                        (position.quantity * position.entry_price + quantity * price) /
-                        total_quantity
-                    )
-                    position.quantity = total_quantity
-                    position.entry_price = weighted_price
-                    position.current_price = price
+                # Update position
+                weighted_price = (
+                    (position.quantity * position.entry_price + delta_quantity * price) /
+                    total_quantity
+                )
+                position.quantity = total_quantity
+                position.entry_price = weighted_price
+                position.current_price = price
+                # Update SL/TP if provided
+                if stop_loss is not None:
+                    position.stop_loss = stop_loss
+                if take_profit is not None:
+                    position.take_profit = take_profit
         
         # Update last trade time
         self.last_trade_time[ticker] = datetime.utcnow()
