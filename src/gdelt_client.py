@@ -41,7 +41,7 @@ class GDELTClient:
         self.session = aiohttp.ClientSession(
             timeout=self.timeout,
             headers={
-                "User-Agent": "StockTraderV2/1.0 (+https://localhost)",
+                "User-Agent": "StockTraderV4-V5-Backtester/1.0 (+https://github.com/rushilpunu/StockTraderV4-V5-Backtester)",
                 "Accept": "application/json"
             }
         )
