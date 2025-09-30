@@ -141,6 +141,53 @@ class AlertSystem:
             }
         }
     
+    def generate_alert(
+        self, 
+        ticker: str,
+        event_data: EventData, 
+        volatility_signal: VolatilitySignal
+    ) -> Optional[TradingAlert]:
+        """
+        Generate a single alert for a ticker.
+        
+        Args:
+            ticker: Stock ticker symbol
+            event_data: Processed GDELT event data
+            volatility_signal: Volatility analysis results
+            
+        Returns:
+            Generated alert or None if no alert should be generated
+        """
+        # Check if we're in cooldown period for this ticker
+        if self._is_in_cooldown(ticker):
+            logger.debug(f"Skipping alert generation for {ticker} - in cooldown period")
+            return None
+        
+        # Check if signal is strong enough to generate an alert
+        if volatility_signal.strength < 0.2:  # Lowered threshold for more sensitivity
+            return None
+        
+        # Generate the most relevant alert based on signal type
+        if volatility_signal.signal_type == 'high_volatility':
+            alert = self._check_volatility_surge(event_data, volatility_signal)
+        elif volatility_signal.signal_type == 'medium_volatility':
+            alert = self._check_sentiment_spike(event_data, volatility_signal)
+        elif volatility_signal.signal_type == 'emerging_volatility':
+            alert = self._check_trading_opportunity(event_data, volatility_signal)
+        else:
+            # For low volatility, check if there's still a trading opportunity
+            if volatility_signal.confidence > 0.3 and volatility_signal.strength > 0.1:
+                alert = self._check_trading_opportunity(event_data, volatility_signal)
+            else:
+                alert = None
+        
+        if alert:
+            self._add_alert(alert)
+            self._update_cooldown(ticker)
+            logger.info(f"Generated {alert.alert_level.value} alert for {ticker}: {alert.alert_type.value}")
+        
+        return alert
+    
     def process_event_data(
         self, 
         event_data: EventData, 

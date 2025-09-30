@@ -237,13 +237,13 @@ class VolatilityAnalyzer:
                     z_score = abs(value - baseline[f"{key}_mean"]) / baseline[f"{key}_std"]
                     anomaly_scores[f"{key}_zscore"] = min(z_score / 3.0, 1.0)  # Normalize to 0-1
         
-        # Threshold-based anomaly detection
+        # Threshold-based anomaly detection (lowered thresholds for more sensitivity)
         thresholds = {
-            'sentiment_score': config.sentiment_threshold_high,
-            'sentiment_change': config.sentiment_change_threshold,
-            'article_volume': config.event_count_threshold,
-            'volatility_index': 0.7,
-            'sentiment_polarization': 0.8
+            'sentiment_score': 0.3,  # Lowered from config.sentiment_threshold_high (0.6)
+            'sentiment_change': 0.1,  # Lowered from config.sentiment_change_threshold (0.2)
+            'article_volume': 3,      # Lowered from config.event_count_threshold (8)
+            'volatility_index': 0.3,  # Lowered from 0.7
+            'sentiment_polarization': 0.4  # Lowered from 0.8
         }
         
         for key, threshold in thresholds.items():
@@ -290,14 +290,14 @@ class VolatilityAnalyzer:
         else:
             direction = 'neutral'
         
-        # Determine signal type
+        # Determine signal type (lowered thresholds for more sensitivity)
         volatility_index = indicators.get('volatility_index', 0.0)
         
-        if strength > 0.7:
+        if strength > 0.5:  # Lowered from 0.7
             signal_type = 'high_volatility'
-        elif strength > 0.4:
+        elif strength > 0.2:  # Lowered from 0.4
             signal_type = 'medium_volatility'
-        elif volatility_index > 0.5:
+        elif volatility_index > 0.2:  # Lowered from 0.5
             signal_type = 'emerging_volatility'
         else:
             signal_type = 'low_volatility'
@@ -312,21 +312,21 @@ class VolatilityAnalyzer:
         
         confidence = statistics.mean([f for f in confidence_factors if f >= 0])
         
-        # Identify triggers
+        # Identify triggers (lowered threshold for more sensitivity)
         triggers = []
         for key, score in anomaly_scores.items():
-            if score > 0.5 and key != 'composite':
+            if score > 0.2 and key != 'composite':  # Lowered from 0.5
                 triggers.append(key.replace('_threshold', '').replace('_zscore', ''))
         
-        # Determine recommended action (more aggressive for medium/emerging)
-        if signal_type == 'high_volatility' and confidence > 0.55:
+        # Determine recommended action (lowered confidence thresholds for more sensitivity)
+        if signal_type == 'high_volatility' and confidence > 0.3:  # Lowered from 0.55
             if direction == 'bullish':
                 recommended_action = 'buy'
             elif direction == 'bearish':
                 recommended_action = 'sell'
             else:
                 recommended_action = 'hold'
-        elif signal_type in ['medium_volatility', 'emerging_volatility'] and confidence > 0.5:
+        elif signal_type in ['medium_volatility', 'emerging_volatility'] and confidence > 0.2:  # Lowered from 0.5
             if direction == 'bullish':
                 recommended_action = 'buy'
             elif direction == 'bearish':
@@ -351,8 +351,8 @@ class VolatilityAnalyzer:
     def _detect_market_event(self, event_data: EventData, signal: VolatilitySignal) -> Optional[MarketEvent]:
         """Detect significant market events."""
         
-        # Only create events for significant signals
-        if signal.strength < 0.5 or signal.confidence < 0.4:
+        # Only create events for significant signals (lowered thresholds)
+        if signal.strength < 0.2 or signal.confidence < 0.2:  # Lowered from 0.5 and 0.4
             return None
         
         # Determine event severity
