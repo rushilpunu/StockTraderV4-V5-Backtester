@@ -20,7 +20,7 @@ venv/
 # Logs
 logs/
 *.log
-archive/**/logs/
+archive/
 
 # Credentials
 config/credentials.py
