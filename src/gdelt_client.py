@@ -283,29 +283,25 @@ class GDELTClient:
         ]
         
         try:
-            # Try query variants across increasing time windows using timespan-based search
-            lookback_hours_options = [hours_back, 4, 12]  # Reduced to avoid excessive API calls
+            # Use fixed 6-hour window for consistent results
+            window_hours = 6  # Fixed window instead of trying multiple
             articles: List[Dict[str, Any]] = []
             chosen_query: Optional[str] = None
-            chosen_window: Optional[int] = None
+            
             for q in query_variants:
-                for window_hours in lookback_hours_options:
-                    # Prefer timespan search with pagination to gather more results
-                    result = await self.get_doc_search_timespan(
-                        q,
-                        window_hours,
-                        max_pages=2,  # Reduced to avoid excessive API calls
-                        page_size=100  # Reduced page size
-                    )
-                    articles = result.get("articles", [])
-                    logger.info(
-                        f"Query variant returned {len(articles)} articles for {ticker}: q='{q}', window={window_hours}h"
-                    )
-                    if len(articles) > 0:
-                        chosen_query = q
-                        chosen_window = window_hours
-                        break
-                if articles:
+                # Use timespan search with single window
+                result = await self.get_doc_search_timespan(
+                    q,
+                    window_hours,
+                    max_pages=1,  # Single page to avoid excessive API calls
+                    page_size=50   # Smaller page size
+                )
+                articles = result.get("articles", [])
+                logger.info(
+                    f"Query variant returned {len(articles)} articles for {ticker}: q='{q}', window={window_hours}h"
+                )
+                if len(articles) > 0:
+                    chosen_query = q
                     break
             
             return {
@@ -315,7 +311,7 @@ class GDELTClient:
                 "ticker": ticker,
                 "company_name": company_name,
                 "search_period": {
-                    "start": (end_date - timedelta(hours=chosen_window or hours_back)).isoformat(),
+                    "start": (end_date - timedelta(hours=window_hours)).isoformat(),
                     "end": end_date.isoformat()
                 }
             }
