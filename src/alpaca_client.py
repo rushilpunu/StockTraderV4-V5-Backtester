@@ -22,8 +22,14 @@ except ImportError:
     logger.error("Alpaca-py not installed. Install with: pip install alpaca-py")
     raise
 
-from .config import config
-from .trading_engine import TradingDecision, TradeAction, OrderType as EngineOrderType
+# Import config from the small capital trader directory
+import sys
+import os
+small_capital_path = os.path.join(os.path.dirname(__file__), '..', 'small_capital_trader')
+sys.path.insert(0, small_capital_path)
+from config import SmallCapitalTradingConfig
+config = SmallCapitalTradingConfig()
+from trading_engine import TradingDecision, TradeAction, OrderType as EngineOrderType
 
 
 @dataclass

@@ -11,8 +11,14 @@ from sklearn.cluster import DBSCAN
 import statistics
 from loguru import logger
 
-from .config import config
-from .data_processor import EventData, SentimentMetrics
+# Import config from the small capital trader directory
+import sys
+import os
+small_capital_path = os.path.join(os.path.dirname(__file__), '..', 'small_capital_trader')
+sys.path.insert(0, small_capital_path)
+from config import SmallCapitalTradingConfig
+config = SmallCapitalTradingConfig()
+from data_processor import EventData, SentimentMetrics
 
 
 @dataclass

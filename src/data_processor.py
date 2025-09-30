@@ -9,8 +9,14 @@ from collections import defaultdict
 import statistics
 from loguru import logger
 
-from .config import config
-from .gdelt_client import extract_sentiment_from_article, extract_themes_from_gkg, is_relevant_to_stock
+# Import config from the small capital trader directory
+import sys
+import os
+small_capital_path = os.path.join(os.path.dirname(__file__), '..', 'small_capital_trader')
+sys.path.insert(0, small_capital_path)
+from config import SmallCapitalTradingConfig
+config = SmallCapitalTradingConfig()
+from gdelt_client import extract_sentiment_from_article, extract_themes_from_gkg, is_relevant_to_stock
 
 
 @dataclass
