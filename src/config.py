@@ -2,22 +2,32 @@
 
 import os
 from typing import List
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
+from config.credentials import load_alpaca_credentials
 
-# Load environment variables
-load_dotenv()
+# Load environment variables only if not already loaded
+if not os.getenv("ALPACA_API_KEY"):
+    load_dotenv()
+
+_DEFAULT_CREDENTIALS = load_alpaca_credentials(required=False)
 
 
 class TradingConfig(BaseSettings):
     """Trading configuration settings."""
     
     # Alpaca API Configuration
-    alpaca_api_key: str = Field(..., env="ALPACA_API_KEY")
-    alpaca_secret_key: str = Field(..., env="ALPACA_SECRET_KEY")
+    alpaca_api_key: str = Field(
+        default=_DEFAULT_CREDENTIALS.api_key if _DEFAULT_CREDENTIALS else "",
+        env="ALPACA_API_KEY",
+    )
+    alpaca_secret_key: str = Field(
+        default=_DEFAULT_CREDENTIALS.api_secret if _DEFAULT_CREDENTIALS else "",
+        env="ALPACA_SECRET_KEY",
+    )
     alpaca_base_url: str = Field(
-        default="https://paper-api.alpaca.markets",
+        default=_DEFAULT_CREDENTIALS.base_url if _DEFAULT_CREDENTIALS else "https://paper-api.alpaca.markets",
         env="ALPACA_BASE_URL"
     )
     
@@ -62,10 +72,21 @@ class TradingConfig(BaseSettings):
     # Exit Enforcement
     enforce_config_exits: bool = Field(default=True, env="ENFORCE_CONFIG_EXITS")
     
+    @model_validator(mode="after")
+    def _validate_credentials(self):
+        if not self.alpaca_api_key or not self.alpaca_secret_key:
+            raise ValueError("Alpaca credentials are missing. Set environment variables or update config.")
+        return self
+
     class Config:
         env_file = ".env"
         case_sensitive = False
 
 
-# Global configuration instance
-config = TradingConfig()
+# Global configuration instance - only create if not already loaded
+try:
+    config = TradingConfig()
+except Exception:
+    # If this fails, it means we're in the small capital trader context
+    # and should use the SmallCapitalTradingConfig instead
+    config = None
