@@ -35,14 +35,36 @@ class YahooFinanceDataFetcher:
     def __init__(self, *, session: Optional[requests.Session] = None) -> None:
         self.session = session or requests.Session()
 
-    def _request(self, ticker: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _request(self, ticker: str, params: Dict[str, Any], *, retries: int = 5, backoff: float = 1.8) -> Optional[Dict[str, Any]]:
         url = self.BASE_URL.format(ticker=ticker)
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-        except requests.RequestException as exc:
-            _LOG.warning("Yahoo chart request failed for %s: %s", ticker, exc)
-            return None
+        attempt = 0
+        time.sleep(0.4)
+        while attempt < retries:
+            attempt += 1
+            try:
+                response = self.session.get(
+                    url,
+                    params=params,
+                    timeout=10,
+                    headers={"User-Agent": "Mozilla/5.0 TraderV5"},
+                )
+                response.raise_for_status()
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if hasattr(exc, "response") and exc.response else None
+                if status == 429 and attempt < retries:
+                    sleep_time = backoff * attempt
+                    _LOG.warning("Yahoo chart throttled for %s; retrying in %.1fs", ticker, sleep_time)
+                    time.sleep(sleep_time)
+                    continue
+                _LOG.warning("Yahoo chart request failed for %s: %s", ticker, exc)
+                return None
+            except requests.RequestException as exc:
+                if attempt < retries:
+                    time.sleep(backoff * attempt)
+                    continue
+                _LOG.warning("Yahoo chart request failed for %s: %s", ticker, exc)
+                return None
+            break
         payload = response.json()
         result = (payload.get("chart") or {}).get("result")
         if not result:
