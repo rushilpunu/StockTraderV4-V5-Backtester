@@ -67,6 +67,8 @@ class ModelDecisionEngine:
         available_funds, per_position_cap = self._position_budget(account, market_value)
 
         # Exit logic for open positions
+        score_note = {"probability_long": f"{probability:.3f}", "score": f"{strength:.3f}"}
+
         if pos_side == "LONG" and quantity > 0:
             if strength <= self.risk.exit_sentiment_threshold:
                 notional = market_value if market_value > 0 else quantity * price
@@ -77,7 +79,7 @@ class ModelDecisionEngine:
                     notional=notional,
                     quantity=quantity,
                     reason="model confidence faded",
-                    metadata={"probability_long": f"{probability:.3f}"},
+                    metadata=score_note,
                 )
             return self._hold(ticker, "maintain long position")
 
@@ -91,7 +93,7 @@ class ModelDecisionEngine:
                     notional=notional,
                     quantity=quantity,
                     reason="model confidence faded",
-                    metadata={"probability_long": f"{probability:.3f}"},
+                    metadata=score_note,
                 )
             return self._hold(ticker, "maintain short position")
 
@@ -116,7 +118,7 @@ class ModelDecisionEngine:
                 notional=notional,
                 price=price,
                 reason="model long conviction",
-                metadata={"probability_long": f"{probability:.3f}"},
+                metadata=score_note,
             )
 
         if strength <= -strength_threshold and self.risk.allow_shorting:
@@ -130,10 +132,10 @@ class ModelDecisionEngine:
                 notional=notional,
                 price=price,
                 reason="model short conviction",
-                metadata={"probability_long": f"{probability:.3f}"},
+                metadata=score_note,
             )
 
-        return self._hold(ticker, "signal below threshold", metadata={"probability_long": f"{probability:.3f}"})
+        return self._hold(ticker, "signal below threshold", metadata=score_note)
 
     def _parse_position(self, position: Optional[Dict[str, Any]], price: float) -> tuple[str, float, float]:
         if not position:
