@@ -11,8 +11,8 @@ import joblib
 import numpy as np
 import pandas as pd
 
-DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "trade_classifier.joblib"
-DEFAULT_METADATA_PATH = Path(__file__).resolve().parents[1] / "models" / "trade_classifier_meta.json"
+DEFAULT_MODEL_PATH = Path(__file__).resolve().parent / "artifacts" / "trade_classifier.joblib"
+DEFAULT_METADATA_PATH = Path(__file__).resolve().parent / "artifacts" / "trade_classifier_meta.json"
 
 
 @dataclass
@@ -46,7 +46,7 @@ class ModelPredictor:
             return float(1.0 / (1.0 + np.exp(-score)))[0]
         raise RuntimeError("Estimator does not support probability outputs")
 
-    def predict_class(self, features: pd.Series | pd.DataFrame | np.ndarray) -> int:
+    def predict_class(self, features: pd.Series | pd.DataFrame | np.ndarray | dict) -> int:
         vector = self._prepare_vector(features)
         estimator = self.bundle.estimator
         prediction = estimator.predict(vector)
@@ -55,8 +55,34 @@ class ModelPredictor:
         if isinstance(prediction, list):
             return int(prediction[0])
         return int(prediction)
+    
+    def batch_predict(self, features_list: list) -> list:
+        """Batch prediction for multiple feature sets."""
+        if not features_list:
+            return []
+        
+        # Prepare all vectors
+        vectors = []
+        for features in features_list:
+            vector = self._prepare_vector(features)
+            vectors.append(vector)
+        
+        # Stack into batch
+        batch_features = np.vstack(vectors)
+        
+        # Make batch prediction
+        estimator = self.bundle.estimator
+        if hasattr(estimator, 'predict_proba'):
+            probas = estimator.predict_proba(batch_features)[:, 1]  # Get positive class probabilities
+            return probas.tolist()
+        else:
+            predictions = estimator.predict(batch_features)
+            return predictions.astype(float).tolist()
 
-    def _prepare_vector(self, features: pd.Series | pd.DataFrame | np.ndarray) -> np.ndarray:
+    def _prepare_vector(self, features: pd.Series | pd.DataFrame | np.ndarray | dict) -> np.ndarray:
+        if isinstance(features, dict):
+            values = [features.get(name, 0.0) for name in self.bundle.features]
+            return np.asarray([values], dtype=float)
         if isinstance(features, pd.DataFrame):
             frame = features[self.bundle.features]
             return frame.values.astype(float)
