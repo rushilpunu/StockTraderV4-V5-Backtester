@@ -12,6 +12,18 @@ from .config import BacktestConfig
 router = APIRouter(prefix="/backtester", tags=["backtester"])
 
 
+@router.get("/available-bots")
+async def get_available_bots() -> Dict:
+    """Get list of available bot variants."""
+    from .bots.base import BOT_REGISTRY
+    
+    return {
+        "bots": list(BOT_REGISTRY.keys()),
+        "count": len(BOT_REGISTRY),
+        "default": "traderv5" if "traderv5" in BOT_REGISTRY else "traderv4",
+    }
+
+
 @router.post("/run")
 async def run_backtest(payload: Dict) -> Dict:
     try:
@@ -22,6 +34,10 @@ async def run_backtest(payload: Dict) -> Dict:
         except (TypeError, ValueError) as err:
             raise ValueError(f"invalid maxWorkers value: {raw_workers!r}") from err
 
+        # Determine default bot based on what's available
+        from .bots.base import BOT_REGISTRY
+        default_bot = "traderv5" if "traderv5" in BOT_REGISTRY else "traderv4"
+        
         config = BacktestConfig(
             tickers=[ticker.upper() for ticker in payload["tickers"]],
             start=datetime.fromisoformat(payload["start"]),
@@ -29,7 +45,7 @@ async def run_backtest(payload: Dict) -> Dict:
             starting_cash=float(payload.get("startingCash", 100_000)),
             sentiment_window_minutes=int(payload.get("sentimentWindowMinutes", 60)),
             bar_timeframe=str(payload.get("timeframe", "15Min")),
-            bot_variants=[variant for variant in payload.get("bots", ["traderv4"])],
+            bot_variants=[variant for variant in payload.get("bots", [default_bot])],
             use_vader=bool(payload.get("useVader", True)),
             use_finbert=bool(payload.get("useFinbert", False)),
             use_keybert=bool(payload.get("useKeybert", False)),
