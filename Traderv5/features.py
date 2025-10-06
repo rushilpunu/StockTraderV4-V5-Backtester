@@ -3,19 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from datetime import datetime, timezone
+from typing import Iterable, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 
-from Traderv5.data_sources import GDELTWindow
-
-
-def _to_naive(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    if index.tz is None:
-        return index
-    return index.tz_convert("UTC").tz_localize(None)
+from Traderv5.services import GDELTSentimentSummary, GDELTWindow, PriceBar
 
 
 def _infer_bar_minutes(index: pd.DatetimeIndex) -> int:
@@ -24,61 +18,49 @@ def _infer_bar_minutes(index: pd.DatetimeIndex) -> int:
     diffs = index.to_series().diff().dropna()
     if diffs.empty:
         return 60
-    median_delta = diffs.median()
-    minutes = max(1, int(median_delta.total_seconds() // 60))
+    minutes = max(1, int(diffs.median().total_seconds() // 60))
     return minutes
 
 
-def _window_counts(article_times: np.ndarray, reference_times: np.ndarray, window: float) -> np.ndarray:
-    """Return counts of articles within `window` minutes preceding each reference time."""
-    counts = np.zeros(len(reference_times), dtype=float)
-    if len(article_times) == 0:
-        return counts
-    left = 0
-    right = 0
-    window_seconds = window * 60.0
-    for idx, ref in enumerate(reference_times):
-        # advance left bound
-        while left < len(article_times) and (ref - article_times[left]) > window_seconds:
-            left += 1
-        right = max(right, left)
-        while right < len(article_times) and (article_times[right] - ref) <= 0:
-            right += 1
-        counts[idx] = max(0, right - left)
-    return counts
-
-
-def _window_average(article_times: np.ndarray, article_values: np.ndarray, reference_times: np.ndarray, window: float) -> np.ndarray:
-    averages = np.zeros(len(reference_times), dtype=float)
-    if len(article_times) == 0:
-        return averages
-    left = 0
-    right = 0
-    window_seconds = window * 60.0
-    for idx, ref in enumerate(reference_times):
-        while left < len(article_times) and (ref - article_times[left]) > window_seconds:
-            left += 1
-        right = max(right, left)
-        while right < len(article_times) and (article_times[right] - ref) <= 0:
-            right += 1
-        if right > left:
-            averages[idx] = float(article_values[left:right].mean())
-        else:
-            averages[idx] = 0.0
-    return averages
-
-
-def _as_epoch_seconds(index: pd.DatetimeIndex) -> np.ndarray:
-    return index.view(np.int64) // 10**9
+def _as_dataframe(price_bars: Iterable[PriceBar] | pd.DataFrame) -> pd.DataFrame:
+    if isinstance(price_bars, pd.DataFrame):
+        frame = price_bars.copy()
+        if frame.index.tz is not None:
+            frame.index = frame.index.tz_convert("UTC").tz_localize(None)
+        frame = frame.sort_index()
+        return frame
+    rows: List[dict] = []
+    for bar in price_bars:
+        timestamp = bar.timestamp
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        timestamp = timestamp.astimezone(timezone.utc)
+        rows.append(
+            {
+                "timestamp": pd.Timestamp(timestamp.replace(tzinfo=None)),
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+                "volume": float(bar.volume),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    frame = pd.DataFrame(rows).set_index("timestamp").sort_index()
+    return frame
 
 
 @dataclass
 class FeatureEngineerConfig:
-    sentiment_windows: Sequence[int] = (15, 60, 240)
-    article_windows: Sequence[int] = (60, 180, 720)
-    price_return_windows: Sequence[int] = (1, 3, 6, 24)
-    momentum_window: int = 12
-    label_horizon_minutes: int = 90
+    price_return_windows: Sequence[int] = (1, 5, 10, 20)
+    volatility_windows: Sequence[int] = (10,)
+    atr_window: int = 14
+    moving_average_windows: Sequence[int] = (5, 10, 20)
+    volume_zscore_window: int = 20
+    sentiment_momentum_windows: Sequence[int] = (1, 3, 5)
+    sentiment_zscore_window: int = 10
+    label_horizon_minutes: int = 1440
     positive_threshold: float = 0.0035
     negative_threshold: float = -0.0035
 
@@ -86,174 +68,208 @@ class FeatureEngineerConfig:
 class FeatureEngineer:
     def __init__(self, config: FeatureEngineerConfig | None = None) -> None:
         self.config = config or FeatureEngineerConfig()
+        self._last_feature_columns: List[str] = []
 
     def build_training_frame(
         self,
         ticker: str,
-        price_bars: pd.DataFrame,
-        gdelt_window: GDELTWindow,
+        price_bars: Iterable[PriceBar] | pd.DataFrame,
+        gdelt_window: Optional[GDELTWindow],
+        *,
+        include_labels: bool = True,
     ) -> pd.DataFrame:
-        if price_bars.empty:
+        price_df = _as_dataframe(price_bars)
+        if price_df.empty:
             return pd.DataFrame()
-        df = price_bars.copy()
-        df.index = _to_naive(df.index)
-        df = df.sort_index()
+        price_df = price_df.sort_index()
+        price_df = price_df.astype(float)
 
-        bar_minutes = _infer_bar_minutes(df.index)
-        if "close" not in df.columns:
-            raise ValueError("price_bars requires 'close' column")
+        enriched = self._price_features(price_df)
+        enriched["session_date"] = enriched.index.normalize()
 
-        df["close"] = df["close"].astype(float)
-        df["volume"] = df.get("volume", pd.Series(index=df.index, dtype=float)).fillna(0.0).astype(float)
+        sentiment_df = self._sentiment_features(gdelt_window, enriched["session_date"])
+        enriched = enriched.join(sentiment_df, on="session_date", how="left")
+        enriched = enriched.drop(columns=["session_date"])
+        enriched = enriched.fillna(0.0)
 
-        df["return_1"] = df["close"].pct_change().fillna(0.0)
-        for window in self.config.price_return_windows:
-            df[f"return_{window}"] = df["close"].pct_change(window).fillna(0.0)
-        df["volatility_6"] = df["return_1"].rolling(6, min_periods=2).std().fillna(0.0)
-        df["volume_z"] = (df["volume"] - df["volume"].rolling(24, min_periods=4).mean()) / (
-            df["volume"].rolling(24, min_periods=4).std().replace({0: np.nan})
-        )
-        df["volume_z"] = df["volume_z"].replace({np.nan: 0.0, np.inf: 0.0, -np.inf: 0.0})
+        if include_labels:
+            labeled = self._label_rows(enriched)
+        else:
+            labeled = enriched.copy()
 
-        tone_series = self._build_tone_series(gdelt_window)
-        article_features = self._build_article_features(gdelt_window, df.index)
+        labeled["ticker"] = ticker
+        labeled = labeled.replace({np.inf: 0.0, -np.inf: 0.0})
+        if include_labels:
+            labeled = labeled.dropna()
+        else:
+            labeled = labeled.dropna(how="all")
 
-        for win in self.config.sentiment_windows:
-            tone_window = tone_series.rolling(f"{win}min").mean().reindex(df.index, method="ffill").fillna(0.0)
-            df[f"tone_{win}"] = tone_window
-            lag_steps = max(1, int(win / max(bar_minutes, 1)))
-            df[f"tone_delta_{win}"] = tone_window - tone_window.shift(lag_steps).fillna(0.0)
-
-        for name, values in article_features.items():
-            df[name] = values
-
-        # Labeling
-        horizon_steps = max(1, int(self.config.label_horizon_minutes / bar_minutes))
-        future_close = df["close"].shift(-horizon_steps)
-        df["forward_return"] = (future_close - df["close"]) / df["close"]
-        df["label"] = 0
-        df.loc[df["forward_return"] >= self.config.positive_threshold, "label"] = 1
-        df.loc[df["forward_return"] <= self.config.negative_threshold, "label"] = -1
-
-        df["ticker"] = ticker
-        return df.dropna()
-
-    def _build_tone_series(self, gdelt_window: GDELTWindow) -> pd.Series:
-        if not gdelt_window.timeline:
-            return pd.Series(dtype=float)
-        timeline_df = pd.DataFrame(
-            {
-                "timestamp": [ts for ts, _ in gdelt_window.timeline],
-                "tone": [tone for _, tone in gdelt_window.timeline],
-            }
-        )
-        timeline_df["timestamp"] = pd.to_datetime(timeline_df["timestamp"], utc=True).dt.tz_convert(None)
-        timeline_df = timeline_df.drop_duplicates(subset="timestamp").set_index("timestamp").sort_index()
-        return timeline_df["tone"]
-
-    def _build_article_features(
-        self, gdelt_window: GDELTWindow, reference_index: pd.DatetimeIndex
-    ) -> Dict[str, pd.Series]:
-        if not gdelt_window.articles:
-            zero = pd.Series(np.zeros(len(reference_index)), index=reference_index)
-            return {
-                "article_count_60": zero,
-                "article_count_180": zero,
-                "article_avg_tone_60": zero,
-            }
-        timestamps: List[datetime] = []
-        tones: List[float] = []
-        for entry in gdelt_window.articles:
-            raw_timestamp = entry.get("seendate") or entry.get("publishtime") or entry.get("date")
-            if not raw_timestamp:
-                continue
-            ts = self._parse_timestamp(raw_timestamp)
-            if ts is None:
-                continue
-            timestamps.append(ts)
-            try:
-                tones.append(float(entry.get("tone", 0.0)))
-            except (TypeError, ValueError):
-                tones.append(0.0)
-        if not timestamps:
-            zero = pd.Series(np.zeros(len(reference_index)), index=reference_index)
-            return {
-                "article_count_60": zero,
-                "article_count_180": zero,
-                "article_avg_tone_60": zero,
-            }
-        article_index = pd.to_datetime(timestamps, utc=True).tz_convert(None)
-        order = np.argsort(article_index.values)
-        article_index = article_index.take(order)
-        tones_array = np.asarray(tones, dtype=float)[order]
-        reference_index = reference_index.tz_localize(None) if reference_index.tz is not None else reference_index
-
-        article_seconds = _as_epoch_seconds(article_index)
-        reference_seconds = _as_epoch_seconds(reference_index)
-
-        counts_60 = _window_counts(article_seconds, reference_seconds, 60)
-        counts_180 = _window_counts(article_seconds, reference_seconds, 180)
-        avg_tone_60 = _window_average(article_seconds, tones_array, reference_seconds, 60)
-
-        return {
-            "article_count_60": pd.Series(counts_60, index=reference_index),
-            "article_count_180": pd.Series(counts_180, index=reference_index),
-            "article_avg_tone_60": pd.Series(avg_tone_60, index=reference_index),
-        }
+        self._last_feature_columns = self.feature_columns(labeled)
+        return labeled
 
     def build_live_features(
         self,
-        price_context: pd.DataFrame,
-        gdelt_window: GDELTWindow,
+        price_context: Iterable[PriceBar] | pd.DataFrame,
+        gdelt_window: Optional[GDELTWindow],
     ) -> Optional[pd.Series]:
-        frame = self.build_training_frame("live", price_context, gdelt_window)
+        frame = self.build_training_frame(
+            "live",
+            price_context,
+            gdelt_window,
+            include_labels=False,
+        )
         if frame.empty:
             return None
         latest = frame.iloc[-1]
-        feature_columns = self.feature_columns(frame)
-        return latest[feature_columns]
+        return latest[self.feature_columns(frame)]
 
     def feature_columns(self, frame: Optional[pd.DataFrame] = None) -> List[str]:
         if frame is not None:
-            return [col for col in frame.columns if col not in {"label", "forward_return", "ticker"}]
-        # fallback ordering
-        columns: List[str] = [
-            "close",
-            "volume",
-            "return_1",
-            *[f"return_{window}" for window in self.config.price_return_windows],
-            "volatility_6",
-            "volume_z",
-        ]
-        for win in self.config.sentiment_windows:
-            columns.append(f"tone_{win}")
-            columns.append(f"tone_delta_{win}")
-        columns.extend([
-            "article_count_60",
-            "article_count_180",
-            "article_avg_tone_60",
-        ])
-        return columns
+            excluded = {"label", "forward_return", "ticker"}
+            return [col for col in frame.columns if col not in excluded]
+        if self._last_feature_columns:
+            return self._last_feature_columns
+        return []
+
+    def _price_features(self, frame: pd.DataFrame) -> pd.DataFrame:
+        df = frame.copy()
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["volume"] = df.get("volume", pd.Series(index=df.index, dtype=float)).fillna(0.0).astype(float)
+
+        # Use fill_method=None to avoid future pandas deprecation warning
+        df["return_1"] = df["close"].pct_change(fill_method=None).fillna(0.0)
+        for window in self.config.price_return_windows:
+            df[f"return_{window}"] = df["close"].pct_change(window, fill_method=None).fillna(0.0)
+
+        for window in self.config.volatility_windows:
+            df[f"volatility_{window}"] = df["return_1"].rolling(window, min_periods=2).std().fillna(0.0)
+
+        df = self._atr_features(df)
+        df = self._moving_average_features(df)
+        df = self._volume_features(df)
+        return df
+
+    def _atr_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+        prev_close = close.shift(1)
+        tr_components = pd.concat([
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1)
+        true_range = tr_components.max(axis=1)
+        atr = true_range.rolling(self.config.atr_window, min_periods=1).mean()
+        df[f"atr_{self.config.atr_window}"] = atr.fillna(0.0)
+        atr_pct = atr / close.replace({0.0: np.nan})
+        df[f"atr_pct_{self.config.atr_window}"] = atr_pct.replace({np.nan: 0.0, np.inf: 0.0, -np.inf: 0.0})
+        return df
+
+    def _moving_average_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        close = df["close"]
+        for window in self.config.moving_average_windows:
+            ma = close.rolling(window, min_periods=1).mean()
+            df[f"sma_{window}"] = ma
+            ratio = (close - ma) / ma.replace({0.0: np.nan})
+            df[f"price_vs_sma_{window}"] = ratio.replace({np.nan: 0.0, np.inf: 0.0, -np.inf: 0.0})
+        return df
+
+    def _volume_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        volume = df["volume"]
+        window = max(2, int(self.config.volume_zscore_window))
+        rolling_mean = volume.rolling(window, min_periods=1).mean()
+        rolling_std = volume.rolling(window, min_periods=1).std().replace({0.0: np.nan})
+        zscore = (volume - rolling_mean) / rolling_std
+        df["volume_z"] = zscore.replace({np.nan: 0.0, np.inf: 0.0, -np.inf: 0.0})
+        return df
+
+    def _sentiment_features(
+        self,
+        gdelt_window: Optional[GDELTWindow],
+        session_dates: pd.Series,
+    ) -> pd.DataFrame:
+        unique_dates = pd.Index(sorted(session_dates.unique()), name="date")
+        if gdelt_window is None or not gdelt_window.summaries:
+            zeros = pd.DataFrame(index=unique_dates)
+            return self._ensure_sentiment_columns(zeros)
+
+        records = []
+        for summary in gdelt_window.summaries:
+            records.append(
+                {
+                    "date": pd.Timestamp(summary.date),
+                    "sentiment_avg": float(summary.average_tone),
+                    "sentiment_std": float(summary.tone_std),
+                    "article_count": int(summary.article_count),
+                    "positive_article_ratio": self._safe_ratio(
+                        summary.positive_article_count,
+                        summary.article_count,
+                    ),
+                    "negative_article_ratio": self._safe_ratio(
+                        summary.negative_article_count,
+                        summary.article_count,
+                    ),
+                    "timeline_points": int(summary.timeline_points),
+                }
+            )
+        sentiment = pd.DataFrame(records)
+        if sentiment.empty:
+            sentiment = pd.DataFrame(index=unique_dates)
+            return self._ensure_sentiment_columns(sentiment)
+        sentiment = sentiment.sort_values("date").set_index("date")
+
+        for window in self.config.sentiment_momentum_windows:
+            shifted = sentiment["sentiment_avg"].shift(window)
+            momentum = sentiment["sentiment_avg"] - shifted
+            sentiment[f"sentiment_momentum_{window}"] = momentum.fillna(0.0)
+
+        window = max(2, int(self.config.sentiment_zscore_window))
+        rolling_mean = sentiment["sentiment_avg"].rolling(window, min_periods=1).mean()
+        rolling_std = sentiment["sentiment_avg"].rolling(window, min_periods=1).std().replace({0.0: np.nan})
+        zscore = (sentiment["sentiment_avg"] - rolling_mean) / rolling_std
+        sentiment["sentiment_z"] = zscore.replace({np.nan: 0.0, np.inf: 0.0, -np.inf: 0.0})
+
+        sentiment = sentiment.reindex(unique_dates).fillna(0.0)
+        return self._ensure_sentiment_columns(sentiment)
 
     @staticmethod
-    def _parse_timestamp(raw: str) -> Optional[datetime]:
-        formats = [
-            "%Y%m%dT%H%M%SZ",
-            "%Y%m%dT%H%M%S",
-            "%Y-%m-%dT%H:%M:%SZ",
-            "%Y-%m-%d %H:%M:%S",
+    def _ensure_sentiment_columns(df: pd.DataFrame) -> pd.DataFrame:
+        columns = [
+            "sentiment_avg",
+            "sentiment_std",
+            "article_count",
+            "positive_article_ratio",
+            "negative_article_ratio",
+            "timeline_points",
         ]
-        for fmt in formats:
-            try:
-                return datetime.strptime(raw, fmt).replace(tzinfo=None)
-            except ValueError:
-                continue
-        if raw.endswith("Z"):
-            try:
-                return datetime.strptime(raw[:-1], "%Y%m%dT%H%M%S")
-            except ValueError:
-                return None
-        return None
+        momentum_cols = [col for col in df.columns if col.startswith("sentiment_momentum_")]
+        columns.extend(momentum_cols)
+        columns.append("sentiment_z")
+        for column in columns:
+            if column not in df.columns:
+                df[column] = 0.0
+        return df[sorted(set(columns))]
+
+    @staticmethod
+    def _safe_ratio(numerator: int, denominator: int) -> float:
+        if denominator <= 0:
+            return 0.0
+        return float(numerator) / float(denominator)
+
+    def _label_rows(self, df: pd.DataFrame) -> pd.DataFrame:
+        result = df.copy()
+        bar_minutes = _infer_bar_minutes(result.index)
+        horizon_steps = max(1, int(self.config.label_horizon_minutes / max(bar_minutes, 1)))
+        future_close = result["close"].shift(-horizon_steps)
+        result["forward_return"] = (future_close - result["close"]) / result["close"]
+        result["label"] = 0
+        result.loc[result["forward_return"] >= self.config.positive_threshold, "label"] = 1
+        result.loc[result["forward_return"] <= self.config.negative_threshold, "label"] = -1
+        return result
 
 
 __all__ = ["FeatureEngineer", "FeatureEngineerConfig"]
