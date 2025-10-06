@@ -131,7 +131,27 @@ def collect_gdelt_window(
 ) -> GDELTWindow:
     """Fetch timeline and article slices for a ticker/time range."""
     client = client or GDELTClient(delay=delay)
-    timeline_payload = client._request(
+    def _gdelt_request(params: Dict[str, str], *, attempts: int = 4) -> Dict[str, Any]:
+        for attempt in range(1, attempts + 1):
+            try:
+                return client._request(params)
+            except requests.RequestException as exc:
+                wait = max(delay, 1.0) * attempt
+                if attempt == attempts:
+                    _LOG.error("GDELT request failed for %s after %s attempts: %s", ticker, attempts, exc)
+                    raise
+                _LOG.warning(
+                    "GDELT request failed for %s (attempt %s/%s): %s; retrying in %.1fs",
+                    ticker,
+                    attempt,
+                    attempts,
+                    exc,
+                    wait,
+                )
+                time.sleep(wait)
+        return {}
+
+    timeline_payload = _gdelt_request(
         {
             "query": ticker,
             "mode": "TimelineTone",
@@ -173,7 +193,7 @@ def collect_gdelt_window(
             "enddatetime": chunk_end.strftime("%Y%m%d%H%M%S"),
             "sort": "DateAsc",
         }
-        payload = client._request(params)
+        payload = _gdelt_request(params)
         articles.extend(payload.get("articles", []))
         chunk_start = chunk_end
         time.sleep(max(0.0, delay - 0.2))
