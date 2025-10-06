@@ -1,0 +1,45 @@
+{
+  "features": [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "return_1",
+    "return_5",
+    "return_10",
+    "return_20",
+    "volatility_10",
+    "atr_14",
+    "atr_pct_14",
+    "sma_5",
+    "price_vs_sma_5",
+    "sma_10",
+    "price_vs_sma_10",
+    "sma_20",
+    "price_vs_sma_20",
+    "volume_z",
+    "article_count",
+    "negative_article_ratio",
+    "positive_article_ratio",
+    "sentiment_avg",
+    "sentiment_std",
+    "sentiment_z",
+    "timeline_points"
+  ],
+  "label_mapping": [
+    -1,
+    1
+  ],
+  "trained_at": 1759289002.0266612,
+  "estimator": "logreg",
+  "scores": {
+    "histgb": 0.5286491116978438,
+    "rf": 0.5328229395821643,
+    "logreg": 0.5419442565173245
+  },
+  "roc_auc": 0.574051711232615,
+  "samples": 1684,
+  "feature_count": 26,
+  "training_type": "price_only"
+}

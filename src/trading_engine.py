@@ -135,17 +135,28 @@ class TradingEngine:
         self.max_portfolio_risk: float = 0.02  # Max 2% portfolio risk per trade
         self.max_sector_exposure: float = 0.3  # Max 30% in any sector
         self.max_single_position: float = 0.1  # Max 10% in single position
-        
+
         # Risk management state
         self.daily_loss_limit: float = 0.05  # Max 5% daily loss
         self.daily_pnl: float = 0.0
         self.consecutive_losses: int = 0
         self.last_trade_time: Dict[str, datetime] = {}
-        
+
         # Performance tracking
         self.total_trades: int = 0
         self.winning_trades: int = 0
         self.total_pnl: float = 0.0
+
+        # Aggressive trading configuration (falls back to sensible defaults)
+        self.aggressive_mode_enabled: bool = bool(
+            getattr(config, "aggressive_mode_enabled", False)
+        )
+        self.aggressive_confidence: float = float(
+            getattr(config, "aggressive_confidence", 0.6)
+        )
+        self.aggressive_min_trade_value: float = float(
+            getattr(config, "aggressive_min_trade_value", 50.0)
+        )
         
     async def evaluate_trading_decision(
         self, 
@@ -173,7 +184,10 @@ class TradingEngine:
         
         # Analyze the alert and determine action
         action = self._determine_trading_action(alert, current_price)
-        
+
+        if action == TradeAction.HOLD and self.aggressive_mode_enabled:
+            action = self._aggressive_action_override(alert)
+
         if action == TradeAction.HOLD:
             logger.info(f"Decision: HOLD for {ticker}")
             return None
@@ -203,7 +217,7 @@ class TradingEngine:
         )
         
         # Final risk assessment
-        if risk_score > 0.9:  # Make threshold more permissive
+        if risk_score > 0.95:  # Allow slightly higher risk for aggressive mode
             logger.warning(f"Trade risk too high for {ticker}: {risk_score}")
             return None
         
@@ -258,11 +272,17 @@ class TradingEngine:
                 return False
         
         # Check alert confidence and level
-        if alert.confidence < 0.25:
+        min_confidence = 0.25
+        if self.aggressive_mode_enabled:
+            min_confidence = 0.2
+
+        if alert.confidence < min_confidence:
             logger.info(f"Alert confidence too low: {alert.confidence}")
             return False
-        
-        if alert.alert_level == AlertLevel.LOW and alert.confidence < 0.5:
+
+        if alert.alert_level == AlertLevel.LOW and alert.confidence < (
+            0.45 if self.aggressive_mode_enabled else 0.5
+        ):
             logger.info("Alert level too low for trading")
             return False
         
@@ -280,8 +300,8 @@ class TradingEngine:
         return True
     
     def _determine_trading_action(
-        self, 
-        alert: TradingAlert, 
+        self,
+        alert: TradingAlert,
         current_price: float
     ) -> TradeAction:
         """Determine the appropriate trading action based on alert."""
@@ -312,6 +332,33 @@ class TradingEngine:
             return TradeAction.SELL
         else:
             return TradeAction.HOLD
+
+    def _aggressive_action_override(self, alert: TradingAlert) -> TradeAction:
+        """Infer a directional trade when the recommendation is neutral."""
+
+        sentiment_bias = alert.sentiment_score + alert.sentiment_change
+        strong_sentiment = abs(sentiment_bias) >= 0.15
+        strong_volatility = alert.volatility_score >= 0.35
+        confidence_ok = alert.confidence >= max(self.aggressive_confidence * 0.8, 0.4)
+
+        if not (strong_volatility and confidence_ok):
+            # Not enough conviction to override the signal
+            return TradeAction.HOLD
+
+        if strong_sentiment:
+            if sentiment_bias > 0:
+                return TradeAction.BUY
+            else:
+                return TradeAction.SELL
+
+        if abs(alert.sentiment_change) >= 0.25:
+            return TradeAction.BUY if alert.sentiment_change > 0 else TradeAction.SELL
+
+        # Fall back to trading in the direction suggested by volatility spikes
+        if alert.alert_level in [AlertLevel.HIGH, AlertLevel.CRITICAL]:
+            return TradeAction.BUY if alert.volatility_score >= 0.5 else TradeAction.SELL
+
+        return TradeAction.HOLD
     
     def _calculate_position_size(
         self, 
@@ -321,11 +368,11 @@ class TradingEngine:
         """Calculate appropriate position size based on risk management."""
         
         # Start with recommended position size from alert
-        base_size = alert.position_size_recommendation
-        
+        base_size = int(alert.position_size_recommendation or 0)
+
         # Adjust based on portfolio risk limits
         max_risk_amount = self.portfolio_value * self.max_portfolio_risk
-        
+
         # Calculate risk per share (distance to stop loss)
         if alert.stop_loss_suggestion:
             risk_per_share = abs(current_price - (current_price * (1 - alert.stop_loss_suggestion)))
@@ -344,11 +391,19 @@ class TradingEngine:
         
         # Take the minimum of all constraints
         position_size = min(
-            base_size,
+            max(base_size, 1),
             max_shares_by_risk,
             max_shares_by_position
         )
-        
+
+        if self.aggressive_mode_enabled and alert.confidence >= self.aggressive_confidence:
+            # Scale position up modestly when conviction is high
+            position_size = int(position_size * 1.2)
+            min_aggressive_shares = int(
+                max(1, self.aggressive_min_trade_value / current_price)
+            )
+            position_size = max(position_size, min_aggressive_shares)
+
         # Apply confidence multiplier
         position_size = int(position_size * confidence_multiplier)
         
@@ -476,7 +531,19 @@ class TradingEngine:
         expected_return = potential_return * confidence
         
         return expected_return
-    
+
+    @staticmethod
+    def _calculate_accuracy_rating(win_rate: float) -> str:
+        """Convert a win rate percentage into a simple accuracy rating."""
+
+        if win_rate >= 70:
+            return "A"
+        if win_rate >= 55:
+            return "B"
+        if win_rate >= 40:
+            return "C"
+        return "D"
+
     def _generate_trading_reasoning(
         self,
         alert: TradingAlert,
@@ -594,8 +661,8 @@ class TradingEngine:
         
         # Calculate performance metrics
         win_rate = (self.winning_trades / self.total_trades * 100) if self.total_trades > 0 else 0
-        
-        return {
+
+        summary = {
             "portfolio_value": total_value,
             "cash": cash,
             "positions_value": positions_value,
@@ -618,6 +685,10 @@ class TradingEngine:
                 for ticker, pos in self.positions.items()
             }
         }
+
+        summary["accuracy_rating"] = self._calculate_accuracy_rating(win_rate)
+
+        return summary
     
     def get_risk_metrics(self) -> RiskMetrics:
         """Calculate comprehensive risk metrics."""
