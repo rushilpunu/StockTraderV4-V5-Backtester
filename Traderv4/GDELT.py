@@ -115,14 +115,19 @@ class GDELTClient:
         return fallback
 
     def fetch_recent_articles(self, ticker: str, minutes_back: int = 90) -> List[GDELTArticle]:
-        timespan = f"{minutes_back}min"
+        # Convert minutes to hours if >= 60, otherwise use minutes
+        if minutes_back >= 60:
+            hours = minutes_back // 60
+            timespan = f"{hours}h"
+        else:
+            timespan = f"{minutes_back}min"
+        
         payload = self._request({
             "query": ticker,
             "mode": "ArtList",
             "format": "JSON",
-            "maxrecords": "250",
-            "sort": "DateDesc",
             "timespan": timespan,
+            "sort": "DateDesc",
         })
         records: List[GDELTArticle] = []
         for entry in payload.get("articles", []):
@@ -140,7 +145,13 @@ class GDELTClient:
         return records
 
     def fetch_sentiment_timeline(self, ticker: str, minutes_back: int = 180) -> Dict:
-        timespan = f"{minutes_back}min"
+        # Convert minutes to hours if >= 60, otherwise use minutes
+        if minutes_back >= 60:
+            hours = minutes_back // 60
+            timespan = f"{hours}h"
+        else:
+            timespan = f"{minutes_back}min"
+        
         return self._request({
             "query": ticker,
             "mode": "TimelineTone",
