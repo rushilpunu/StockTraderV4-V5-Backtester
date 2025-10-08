@@ -20,7 +20,7 @@ try:
 except Exception:  # pragma: no cover - fallback when vader not installed
     _vader = None
 
-from .data_sources import fetch_gdelt_articles, fetch_gdelt_timeline
+from .data_sources import fetch_gdelt_articles, fetch_gdelt_timeline, fetch_price_bars
 
 _LOG = logging.getLogger(__name__)
 
@@ -177,6 +177,85 @@ def _value_at(ts: pd.Timestamp, mapping: Dict[pd.Timestamp, float]) -> float:
     return mapping[nearest]
 
 
+def _price_derived_snapshots(
+    ticker: str,
+    start: datetime,
+    end: datetime,
+    granularity_minutes: int,
+) -> List[SentimentSnapshot]:
+    """Derive sentiment-like signals directly from historical prices."""
+
+    # Expand the lookback window so momentum calculations have context.
+    lookback_days = max(10, granularity_minutes // 60 * 5)
+    start_buffer = start - timedelta(days=lookback_days)
+    try:
+        price_df = fetch_price_bars(ticker, start_buffer, end, timeframe="1Day")
+    except Exception as exc:  # pragma: no cover - defensive logging
+        _LOG.error("Unable to derive price-based sentiment for %s: %s", ticker, exc)
+        return []
+    if price_df.empty or "close" not in price_df.columns:
+        return []
+
+    frame = price_df.copy()
+    frame.index = pd.to_datetime(frame.index)
+    frame = frame.sort_index()
+    closes = frame["close"].astype(float)
+    opens = frame.get("open", closes)
+    volumes = frame.get("volume", pd.Series(0.0, index=frame.index)).astype(float)
+
+    returns = closes.pct_change().fillna(0.0)
+    tone_short = returns.rolling(3, min_periods=1).mean()
+    tone_medium = returns.rolling(10, min_periods=1).mean()
+    tone_long = returns.rolling(21, min_periods=1).mean()
+
+    range_ratio = ((closes - opens) / opens.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    volume_ratio = (volumes / volumes.rolling(20, min_periods=1).mean()).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    prev_closes = closes.shift(1).bfill().fillna(closes)
+
+    snapshots: List[SentimentSnapshot] = []
+    prev_short = prev_medium = prev_long = 0.0
+    for ts, short_val, medium_val, long_val in zip(tone_short.index, tone_short, tone_medium, tone_long):
+        if ts < pd.Timestamp(start) or ts > pd.Timestamp(end):
+            continue
+        vader_score = float(np.tanh(range_ratio.loc[ts] * 5.0))
+        vol_ratio = float(np.clip(volume_ratio.loc[ts], 0.0, 5.0))
+        movement = float(closes.loc[ts] - prev_closes.loc[ts])
+        keywords = []
+        if movement > 0:
+            keywords.append("momentum")
+        elif movement < 0:
+            keywords.append("pullback")
+        else:
+            keywords.append("range-bound")
+        if abs(short_val) > abs(medium_val):
+            keywords.append("impulse")
+        else:
+            keywords.append("trend")
+        keywords = list(dict.fromkeys(keywords))
+        article_count = max(0, int(round(vol_ratio * 2)))
+
+        snapshots.append(
+            SentimentSnapshot(
+                timestamp=ts.to_pydatetime(),
+                ticker=ticker,
+                tone_15=float(short_val),
+                tone_60=float(medium_val),
+                tone_1440=float(long_val),
+                delta_15=float(short_val - prev_short),
+                delta_60=float(medium_val - prev_medium),
+                delta_1440=float(long_val - prev_long),
+                vader=vader_score,
+                finbert=None,
+                keywords=keywords,
+                source_score=vol_ratio,
+                article_count=article_count,
+            )
+        )
+        prev_short, prev_medium, prev_long = short_val, medium_val, long_val
+
+    return snapshots
+
+
 def build_sentiment_snapshots(
     ticker: str,
     start: datetime,
@@ -237,6 +316,8 @@ def build_sentiment_snapshots(
         )
 
         prev15, prev60, prev1440 = tone15, tone60, tone1440
+    if not snapshots:
+        snapshots = _price_derived_snapshots(ticker, start, end, granularity_minutes)
     return snapshots
 
 

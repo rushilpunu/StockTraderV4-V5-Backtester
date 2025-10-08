@@ -62,15 +62,230 @@ class ModelDecisionEngine:
         signal = SignalContext(probability_long=probability, features=features)
         strength = signal.signal_strength
 
-        pos_side, quantity, market_value = self._parse_position(position, price)
+        def _feature(name: str, default: float = 0.0) -> float:
+            raw_value = features.get(name, default)
+            try:
+                return float(raw_value)
+            except (TypeError, ValueError):
+                return default
+
+        aggressiveness = max(0.25, float(getattr(self.risk, "aggressiveness", 1.0)))
+        entry_bias = float(getattr(self.risk, "entry_signal_bias", 0.0))
+        base_entry_threshold = max(0.0, float(self.risk.entry_sentiment_threshold) - entry_bias)
+        strength_threshold = max(0.02, min(0.35, base_entry_threshold / aggressiveness))
+
+        exit_base = max(0.0, float(self.risk.exit_sentiment_threshold) - entry_bias * 0.5)
+        exit_threshold = max(0.01, min(0.25, exit_base / max(1.0, aggressiveness * 0.7)))
+        long_exit_threshold = exit_threshold
+        short_exit_threshold = -exit_threshold
+
+        (
+            pos_side,
+            quantity,
+            market_value,
+            entry_price,
+            position_cost,
+        ) = self._parse_position(position, price)
 
         available_funds, per_position_cap = self._position_budget(account, market_value)
 
+        momentum = (
+            0.35 * _feature("return_5")
+            + 0.25 * _feature("price_vs_sma_10")
+            + 0.2 * _feature("return_10")
+            + 0.2 * _feature("price_vs_sma_20")
+        )
+        short_momentum = (
+            0.45 * _feature("return_5")
+            + 0.35 * _feature("return_10")
+            + 0.2 * _feature("price_vs_sma_20")
+        )
+        sentiment_avg = _feature("sentiment_avg")
+        sentiment_std = _feature("sentiment_std")
+        volume_z = _feature("volume_z")
+        volatility_pct = abs(_feature("atr_pct_14"))
+        return_1 = _feature("return_1")
+        return_20 = _feature("return_20")
+        price_vs_sma_5 = _feature("price_vs_sma_5")
+        price_vs_sma_10 = _feature("price_vs_sma_10")
+        price_vs_sma_20 = _feature("price_vs_sma_20")
+
+        momentum_floor = getattr(self.risk, "momentum_entry_floor", 0.0015)
+        quick_floor = getattr(self.risk, "fast_momentum_floor", momentum_floor * 0.5)
+        sentiment_floor = getattr(self.risk, "sentiment_entry_floor", -0.05)
+        volume_floor = getattr(self.risk, "volume_entry_floor", -1.25)
+        volatility_cap = getattr(self.risk, "volatility_entry_cap", 0.14)
+        price_bias_floor = getattr(self.risk, "price_bias_entry_floor", -0.01)
+
+        short_momentum_ceiling = getattr(self.risk, "momentum_short_ceiling", -momentum_floor)
+        short_sentiment_ceiling = getattr(self.risk, "sentiment_short_ceiling", 0.08)
+        short_volume_floor = getattr(self.risk, "volume_short_floor", -1.5)
+        short_price_ceiling = getattr(self.risk, "price_bias_short_ceiling", 0.02)
+        short_volatility_cap = getattr(
+            self.risk,
+            "volatility_short_cap",
+            volatility_cap * 1.3 if volatility_cap > 0 else 0.0,
+        )
+        short_fast_threshold = short_momentum_ceiling * 0.5
+        volatility_cap_str = "n/a" if volatility_cap <= 0 else f"{volatility_cap:.3f}"
+        short_volatility_cap_str = "n/a" if short_volatility_cap <= 0 else f"{short_volatility_cap:.3f}"
+
+        long_gates = {
+            "momentum": momentum >= momentum_floor,
+            "fast_return": return_1 >= quick_floor,
+            "sentiment": sentiment_avg >= sentiment_floor,
+            "volume": volume_z >= volume_floor,
+            "volatility": True if volatility_cap <= 0 else volatility_pct <= volatility_cap,
+            "price_bias": price_vs_sma_10 >= price_bias_floor and price_vs_sma_20 >= price_bias_floor,
+        }
+        short_gates = {
+            "momentum": short_momentum <= short_momentum_ceiling,
+            "fast_return": return_1 <= short_momentum_ceiling * 0.5,
+            "sentiment": sentiment_avg <= short_sentiment_ceiling,
+            "volume": volume_z >= short_volume_floor,
+            "volatility": True if short_volatility_cap <= 0 else volatility_pct <= short_volatility_cap,
+            "price_bias": price_vs_sma_10 <= short_price_ceiling and price_vs_sma_20 <= short_price_ceiling,
+        }
+
+        def _gate_summary(gates: Dict[str, bool]) -> str:
+            return ",".join(f"{name}:{int(flag)}" for name, flag in gates.items())
+
+        base_metadata: Dict[str, str] = {
+            "prob_long": f"{probability:.3f}",
+            "signal_strength": f"{strength:.3f}",
+            "entry_threshold": f"{strength_threshold:.3f}",
+            "exit_threshold": f"{exit_threshold:.3f}",
+            "momentum": f"{momentum:.4f}",
+            "short_momentum": f"{short_momentum:.4f}",
+            "sentiment": f"{sentiment_avg:.4f}",
+            "sentiment_std": f"{sentiment_std:.4f}",
+            "volume_z": f"{volume_z:.3f}",
+            "volatility_pct": f"{volatility_pct:.4f}",
+            "return_1": f"{return_1:.4f}",
+            "return_20": f"{return_20:.4f}",
+            "price_vs_sma_5": f"{price_vs_sma_5:.4f}",
+            "price_vs_sma_10": f"{price_vs_sma_10:.4f}",
+            "price_vs_sma_20": f"{price_vs_sma_20:.4f}",
+            "available_funds": f"{available_funds:.2f}",
+            "per_position_cap": f"{per_position_cap:.2f}",
+            "long_gates": _gate_summary(long_gates),
+            "short_gates": _gate_summary(short_gates),
+            "long_gate_thresholds": (
+                f"momentum>={momentum_floor:.4f};fast>={quick_floor:.4f};sentiment>={sentiment_floor:.4f};"
+                f"volume>={volume_floor:.2f};volatility<={volatility_cap_str};price_bias>={price_bias_floor:.4f}"
+            ),
+            "short_gate_thresholds": (
+                f"momentum<={short_momentum_ceiling:.4f};fast<={short_fast_threshold:.4f};sentiment<={short_sentiment_ceiling:.4f};"
+                f"volume>={short_volume_floor:.2f};volatility<={short_volatility_cap_str};price_bias<={short_price_ceiling:.4f}"
+            ),
+        }
+
+        if quantity > 0:
+            base_metadata.update(
+                {
+                    "position_side": pos_side,
+                    "position_quantity": f"{quantity:.4f}",
+                    "position_market_value": f"{market_value:.2f}",
+                }
+            )
+            if entry_price and entry_price > 0:
+                base_metadata["position_entry_price"] = f"{entry_price:.4f}"
+                if pos_side == "LONG":
+                    profit_pct = (price - entry_price) / entry_price
+                else:
+                    profit_pct = (entry_price - price) / entry_price
+                base_metadata["position_profit_pct"] = f"{profit_pct:.4f}"
+            if position_cost is not None:
+                base_metadata["position_cost_basis"] = f"{position_cost:.4f}"
+
         # Exit logic for open positions
-        score_note = {"probability_long": f"{probability:.3f}", "score": f"{strength:.3f}"}
+        score_note = {
+            "probability_long": base_metadata["prob_long"],
+            "signal_strength": base_metadata["signal_strength"],
+            "momentum": base_metadata["momentum"],
+            "sentiment": base_metadata["sentiment"],
+        }
+
+        take_profit_pct = max(0.0, float(getattr(self.risk, "take_profit_pct", 0.0)))
+        stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.0)))
+        take_profit_tolerance = max(
+            0.0,
+            min(0.5, float(getattr(self.risk, "take_profit_tolerance", 0.1))),
+        )
 
         if pos_side == "LONG" and quantity > 0:
-            if strength <= self.risk.exit_sentiment_threshold:
+            profit_pct = None
+            if entry_price and entry_price > 0:
+                profit_pct = (price - entry_price) / entry_price
+            trigger_pct = take_profit_pct * max(0.0, 1.0 - take_profit_tolerance)
+            target_band = max(trigger_pct, take_profit_pct)
+            if (
+                take_profit_pct > 0
+                and profit_pct is not None
+                and profit_pct >= target_band
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "target_profit_pct": f"{take_profit_pct:.4f}",
+                    "trigger_pct": f"{target_band:.4f}",
+                    "long_gates": base_metadata["long_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="SELL",
+                    confidence=abs(strength) if strength != 0 else 0.75,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="target profit reached",
+                    metadata=metadata,
+                )
+            if (
+                take_profit_pct > 0
+                and profit_pct is not None
+                and profit_pct >= trigger_pct
+                and profit_pct < target_band
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "target_profit_pct": f"{take_profit_pct:.4f}",
+                    "trigger_pct": f"{trigger_pct:.4f}",
+                    "long_gates": base_metadata["long_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="SELL",
+                    confidence=abs(strength) if strength != 0 else 0.72,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="profit within target band",
+                    metadata=metadata,
+                )
+            if (
+                stop_loss_pct > 0
+                and profit_pct is not None
+                and profit_pct <= -stop_loss_pct
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "stop_loss_pct": f"{-stop_loss_pct:.4f}",
+                    "long_gates": base_metadata["long_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="SELL",
+                    confidence=abs(strength) if strength != 0 else 0.65,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="stop loss breached",
+                    metadata=metadata,
+                )
+            if strength <= long_exit_threshold:
                 notional = market_value if market_value > 0 else quantity * price
                 return self._exit_trade(
                     ticker,
@@ -79,12 +294,83 @@ class ModelDecisionEngine:
                     notional=notional,
                     quantity=quantity,
                     reason="model confidence faded",
-                    metadata=score_note,
+                    metadata={**score_note, "long_gates": base_metadata["long_gates"]},
                 )
-            return self._hold(ticker, "maintain long position")
+            return self._hold(ticker, "maintain long position", metadata=dict(base_metadata))
 
         if pos_side == "SHORT" and quantity > 0:
-            if strength >= -self.risk.exit_sentiment_threshold:
+            profit_pct = None
+            if entry_price and entry_price > 0:
+                profit_pct = (entry_price - price) / entry_price
+            trigger_pct = take_profit_pct * max(0.0, 1.0 - take_profit_tolerance)
+            target_band = max(trigger_pct, take_profit_pct)
+            if (
+                take_profit_pct > 0
+                and profit_pct is not None
+                and profit_pct >= target_band
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "target_profit_pct": f"{take_profit_pct:.4f}",
+                    "trigger_pct": f"{target_band:.4f}",
+                    "short_gates": base_metadata["short_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="BUY",
+                    confidence=abs(strength) if strength != 0 else 0.75,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="target profit reached",
+                    metadata=metadata,
+                )
+            if (
+                take_profit_pct > 0
+                and profit_pct is not None
+                and profit_pct >= trigger_pct
+                and profit_pct < target_band
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "target_profit_pct": f"{take_profit_pct:.4f}",
+                    "trigger_pct": f"{trigger_pct:.4f}",
+                    "short_gates": base_metadata["short_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="BUY",
+                    confidence=abs(strength) if strength != 0 else 0.72,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="profit within target band",
+                    metadata=metadata,
+                )
+            if (
+                stop_loss_pct > 0
+                and profit_pct is not None
+                and profit_pct <= -stop_loss_pct
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "stop_loss_pct": f"{-stop_loss_pct:.4f}",
+                    "short_gates": base_metadata["short_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="BUY",
+                    confidence=abs(strength) if strength != 0 else 0.65,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="stop loss breached",
+                    metadata=metadata,
+                )
+            if strength >= short_exit_threshold:
                 notional = market_value if market_value > 0 else quantity * price
                 return self._exit_trade(
                     ticker,
@@ -93,53 +379,82 @@ class ModelDecisionEngine:
                     notional=notional,
                     quantity=quantity,
                     reason="model confidence faded",
-                    metadata=score_note,
+                    metadata={**score_note, "short_gates": base_metadata["short_gates"]},
                 )
-            return self._hold(ticker, "maintain short position")
+            return self._hold(ticker, "maintain short position", metadata=dict(base_metadata))
 
         # Entry gates
-        strength_threshold = max(self.risk.entry_sentiment_threshold, 0.05)
         cooldown_active = self._cooldown_active(ticker)
         if cooldown_active:
-            return self._hold(ticker, "cooldown active")
+            return self._hold(ticker, "cooldown active", metadata=dict(base_metadata))
         if open_positions >= self.risk.max_positions:
-            return self._hold(ticker, "max positions reached")
+            return self._hold(ticker, "max positions reached", metadata=dict(base_metadata))
         if not self.trade_tracker.can_enter():
-            return self._hold(ticker, "day trade limit reached")
+            return self._hold(ticker, "day trade limit reached", metadata=dict(base_metadata))
 
         if strength >= strength_threshold:
+            failing = [name for name, ok in long_gates.items() if not ok]
+            if failing:
+                meta = dict(base_metadata)
+                meta["gate_block"] = "long:" + ",".join(failing)
+                return self._hold(
+                    ticker,
+                    f"long gate blocked:{'/'.join(failing)}",
+                    metadata=meta,
+                )
             notional = self._size_trade(available_funds, per_position_cap, strength)
             if notional <= 0:
-                return self._hold(ticker, "insufficient capital")
+                meta = dict(base_metadata)
+                meta["sizing_block"] = "notional<=0"
+                return self._hold(ticker, "insufficient capital", metadata=meta)
             return self._enter_trade(
                 ticker,
                 action="BUY",
                 confidence=abs(strength),
                 notional=notional,
                 price=price,
-                reason="model long conviction",
-                metadata=score_note,
+                reason=(
+                    f"long conviction prob={probability:.1%}>=min={(0.5 + strength_threshold):.1%},"
+                    f" momentum={momentum:.3f}"
+                ),
+                metadata={**base_metadata, "position_notional": f"{notional:.2f}"},
             )
 
         if strength <= -strength_threshold and self.risk.allow_shorting:
+            failing = [name for name, ok in short_gates.items() if not ok]
+            if failing:
+                meta = dict(base_metadata)
+                meta["gate_block"] = "short:" + ",".join(failing)
+                return self._hold(
+                    ticker,
+                    f"short gate blocked:{'/'.join(failing)}",
+                    metadata=meta,
+                )
             notional = self._size_trade(available_funds, per_position_cap, abs(strength))
             if notional <= 0:
-                return self._hold(ticker, "insufficient capital")
+                meta = dict(base_metadata)
+                meta["sizing_block"] = "notional<=0"
+                return self._hold(ticker, "insufficient capital", metadata=meta)
             return self._enter_trade(
                 ticker,
                 action="SELL",
                 confidence=abs(strength),
                 notional=notional,
                 price=price,
-                reason="model short conviction",
-                metadata=score_note,
+                reason=(
+                    f"short conviction prob={(1 - probability):.1%}>=min={(0.5 + strength_threshold):.1%},"
+                    f" momentum={short_momentum:.3f}"
+                ),
+                metadata={**base_metadata, "position_notional": f"{notional:.2f}"},
             )
 
-        return self._hold(ticker, "signal below threshold", metadata=score_note)
+        return self._hold(ticker, "signal below threshold", metadata=dict(base_metadata))
 
-    def _parse_position(self, position: Optional[Dict[str, Any]], price: float) -> tuple[str, float, float]:
+    def _parse_position(
+        self, position: Optional[Dict[str, Any]], price: float
+    ) -> tuple[str, float, float, Optional[float], Optional[float]]:
         if not position:
-            return "FLAT", 0.0, 0.0
+            return "FLAT", 0.0, 0.0, None, None
         try:
             quantity = abs(float(position.get("quantity", 0.0)))
         except (TypeError, ValueError):
@@ -148,16 +463,24 @@ class ModelDecisionEngine:
             market_value = abs(float(position.get("market_value", quantity * price)))
         except (TypeError, ValueError):
             market_value = quantity * price
+        cost_basis_raw = position.get("cost_basis") if isinstance(position, dict) else None
+        try:
+            cost_basis = float(cost_basis_raw) if cost_basis_raw is not None else None
+        except (TypeError, ValueError):
+            cost_basis = None
         raw_side = str(position.get("side", "")).upper()
         if quantity <= 0:
-            return "FLAT", 0.0, 0.0
+            return "FLAT", 0.0, 0.0, None, cost_basis
         if raw_side in {"LONG", "BUY"}:
             side = "LONG"
         elif raw_side in {"SHORT", "SELL"}:
             side = "SHORT"
         else:
             side = "LONG"
-        return side, quantity, market_value
+        entry_price = None
+        if quantity > 0 and cost_basis not in (None, 0):
+            entry_price = abs(cost_basis) / quantity
+        return side, quantity, market_value, entry_price, cost_basis
 
     def _position_budget(self, account: AccountSnapshot, market_value: float) -> tuple[float, float]:
         equity = account.equity or account.portfolio_value or account.cash
@@ -172,9 +495,19 @@ class ModelDecisionEngine:
         return available_funds, per_position_cap
 
     def _size_trade(self, available_funds: float, per_position_cap: float, strength: float) -> float:
-        base = min(available_funds, per_position_cap)
-        scaled = base * min(max(strength, 0.05), 1.0)
-        return float(scaled)
+        if per_position_cap <= 0:
+            return 0.0
+        aggressiveness = max(0.4, float(getattr(self.risk, "aggressiveness", 1.0)))
+        leverage_cap = max(0.25, float(getattr(self.risk, "max_trade_leverage", 1.0)))
+        capital_ceiling = per_position_cap * min(leverage_cap, 2.5)
+        capital_floor = max(per_position_cap, available_funds)
+        base = min(capital_ceiling, capital_floor)
+        if base <= 0:
+            return 0.0
+        conviction = max(0.0, min(1.0, strength)) ** 0.65
+        ramp = (0.78 + 0.42 * min(aggressiveness, 3.5)) * conviction + 0.08
+        position_fraction = max(0.06, min(leverage_cap, ramp))
+        return float(base * position_fraction)
 
     def _cooldown_active(self, ticker: str) -> bool:
         last_trade = self.last_trade_at.get(ticker)
@@ -210,18 +543,36 @@ class ModelDecisionEngine:
         if notional <= 0:
             return self._hold(ticker, "invalid notional")
         quantity = notional / price if price > 0 else None
+        stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.0)))
+        take_profit_pct = max(0.0, float(getattr(self.risk, "take_profit_pct", 0.0)))
+
+        take_profit_price: Optional[float]
+        stop_loss_price: Optional[float]
+        if action.upper() == "BUY":
+            take_profit_price = price * (1 + take_profit_pct) if take_profit_pct > 0 else None
+            stop_loss_price = price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
+        else:
+            take_profit_price = price * (1 - take_profit_pct) if take_profit_pct > 0 else None
+            stop_loss_price = price * (1 + stop_loss_pct) if stop_loss_pct > 0 else None
+
+        metadata = metadata or {}
+        if take_profit_price:
+            metadata = {**metadata, "take_profit_price": f"{take_profit_price:.4f}"}
+        if stop_loss_price:
+            metadata = {**metadata, "stop_loss_price": f"{stop_loss_price:.4f}"}
+
         decision = TradeDecision(
             ticker=ticker,
             action=action,
             confidence=float(min(max(confidence, 0.0), 1.0)),
             notional=float(notional),
             time_in_force="gtc",
-            stop_loss=None,
-            take_profit=None,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
             reason=reason,
             intent="entry",
             quantity=quantity,
-            metadata=metadata or {},
+            metadata=metadata,
         )
         self.last_trade_at[ticker] = datetime.utcnow()
         return decision

@@ -8,6 +8,7 @@ import signal
 import time
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import Mapping, Optional
 
 # Add parent directory to path and change to it
 parent_dir = Path(__file__).parent.parent
@@ -65,35 +66,51 @@ def check_alpaca_credentials():
         return False
 
 
-def ensure_models_trained():
+def ensure_models_trained(variant: str = "core"):
     """Ensure models are trained and show model info."""
-    logger.info("🤖 Checking model training status...")
-    
+
+    label = variant.lower().strip()
+    logger.info("🤖 Checking model training status (%s variant)...", label)
+
+    if label in {"swing", "swing-trader", "swing_trader"}:
+        try:
+            from Traderv5.swing.model import load_swing_predictor
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.error("❌ Failed to initialise swing predictor: %s", exc)
+            return None
+
+        predictor = load_swing_predictor()
+        logger.info("✅ Loaded swing trading heuristic model")
+        logger.info("   🏷️  Model Variant: swing-heuristic")
+        logger.info("   🎯 Horizon: multi-day (≈5 sessions)")
+        logger.info("   📈 Bias: long-only, trend + sentiment confirmation")
+        return predictor
+
     try:
         from Traderv5.model.predictor import ModelPredictor
         import joblib
         from pathlib import Path
-        
+
         predictor = ModelPredictor.load_default()
-        
+
         # Get model info
         model_path = Path(__file__).parent.parent / "Traderv5" / "model" / "artifacts"
         model_file = model_path / "trade_classifier.joblib"
         meta_file = model_path / "trade_classifier_meta.json"
-        
+
         logger.info("✅ Models loaded successfully")
         logger.info(f"   📁 Model Path: {model_file}")
-        
+
         # Show model metadata if available
         if meta_file.exists():
             import json
             with open(meta_file, 'r') as f:
                 meta = json.load(f)
-            
+
             logger.info(f"   🏷️  Model Type: {meta.get('model_type', 'Unknown')}")
             logger.info(f"   📊 Features: {len(meta.get('features', []))} features")
             logger.info(f"   🎯 Training Samples: {meta.get('n_samples', 'Unknown')}")
-            
+
             if 'metrics' in meta:
                 metrics = meta['metrics']
                 logger.info(f"   📈 Model Performance:")
@@ -105,7 +122,7 @@ def ensure_models_trained():
                     logger.info(f"      • Recall: {metrics['recall']:.2%}")
                 if 'f1_score' in metrics:
                     logger.info(f"      • F1 Score: {metrics['f1_score']:.2%}")
-        
+
         # Get model file modification time
         import os
         if os.path.exists(model_file):
@@ -113,9 +130,9 @@ def ensure_models_trained():
             mod_time = os.path.getmtime(model_file)
             mod_date = datetime.datetime.fromtimestamp(mod_time)
             logger.info(f"   📅 Last Updated: {mod_date.strftime('%Y-%m-%d %H:%M:%S')}")
-        
+
         return predictor
-            
+
     except FileNotFoundError:
         logger.error("❌ No trained models found")
         logger.error("Run: python3 Traderv5/model/training.py")
@@ -127,42 +144,134 @@ def ensure_models_trained():
         return None
 
 
-def run_live_trading(predictor):
+def run_live_trading(
+    predictor,
+    *,
+    profile_name: Optional[str] = None,
+    risk_overrides: Optional[Mapping[str, object]] = None,
+    cycle_pause_seconds: Optional[int] = None,
+    allow_shorting: Optional[bool] = None,
+    day_trade_limit: Optional[int] = None,
+    expected_equity: Optional[float] = None,
+    verbose: bool = True,
+):
     """Start the live trading system."""
     logger.info("🚀 Starting live trading system...")
     
     shutdown_requested = False
-    
+    runner = None
+
     def signal_handler(signum, frame):
-        nonlocal shutdown_requested
+        nonlocal shutdown_requested, runner
         logger.info(f"Received signal {signum}, shutting down...")
         shutdown_requested = True
+        if runner is not None:
+            try:
+                runner.stop()
+            except Exception:
+                logger.debug("Runner stop request failed during signal handling", exc_info=True)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
         from Traderv5.configuration import load_trading_parameters
-        from Traderv5.trader import ModelDrivenTrader, TraderV5Config
+        from Traderv5.trader import (
+            ModelDrivenTrader,
+            ReactiveTraderRunner,
+            TraderV5Config,
+        )
         from Traderv4.funcs import RiskConfig
+        from Traderv5.risk_profiles import AggressiveProfile, apply_profile, get_profile
         from config.credentials import load_alpaca_credentials
         from alpaca_trade_api import REST
-        
+
         # Load config
         logger.info("Loading configuration...")
         config_params = load_trading_parameters()
-        
+
         # Create TraderV5Config
+        env_profile = os.getenv("TRADERV5_RISK_PROFILE")
+        requested_profile = profile_name or env_profile or AggressiveProfile.name
+        try:
+            profile = get_profile(requested_profile)
+        except KeyError:
+            logger.warning(
+                "Unknown risk profile '%s'; falling back to '%s'",
+                requested_profile,
+                AggressiveProfile.name,
+            )
+            profile = AggressiveProfile
+        else:
+            if requested_profile.lower() != profile.name:
+                logger.warning(
+                    "Normalised live risk profile from '%s' to '%s'", requested_profile, profile.name
+                )
+            elif profile_name and env_profile and profile_name.lower() != env_profile.lower():
+                logger.info(
+                    "Overriding TRADERV5_RISK_PROFILE='%s' with explicit profile '%s'",
+                    env_profile,
+                    profile.name,
+                )
+
+        logger.info("Applying %s risk profile", profile.name.title())
+
         risk_config = RiskConfig(
-            max_capital_fraction=config_params.risk.risk_per_trade_pct,
-            max_positions=5,
+            max_capital_fraction=profile.max_capital_fraction,
+            max_positions=profile.max_positions,
             stop_loss_pct=config_params.risk.atr_stop_multiplier * 0.01,
             take_profit_pct=config_params.risk.take_profit_multiple * 0.01,
-            cooldown_minutes=30,
-            entry_sentiment_threshold=0.6,
-            exit_sentiment_threshold=0.4,
+            cooldown_minutes=profile.cooldown,
+            entry_sentiment_threshold=profile.entry_threshold,
+            exit_sentiment_threshold=profile.exit_threshold,
+            allow_shorting=True,
         )
-        
+
+        capital_from_risk = max(
+            profile.max_capital_fraction,
+            config_params.risk.risk_per_trade_pct * 8.5,
+        )
+        overrides = {
+            "max_capital_fraction": min(0.48, capital_from_risk),
+            "max_positions": max(profile.max_positions, 6),
+            "entry": max(0.032, profile.entry_threshold * 0.82),
+            "exit": max(0.015, profile.exit_threshold * 0.78),
+            "aggressiveness": profile.aggressiveness * max(1.05, config_params.risk.aggressiveness),
+            "bias": profile.entry_bias + max(0.0, config_params.risk.entry_signal_bias),
+            "leverage": max(profile.leverage, config_params.risk.max_trade_leverage or 1.6),
+        }
+        if risk_overrides:
+            logger.info(
+                "Applying %d custom risk override(s): %s",
+                len(risk_overrides),
+                ", ".join(sorted(risk_overrides.keys())),
+            )
+            overrides.update(risk_overrides)
+        if allow_shorting is not None:
+            overrides["allow_shorting"] = allow_shorting
+        else:
+            overrides.setdefault("allow_shorting", True)
+
+        apply_profile(risk_config, profile, overrides=overrides)
+
+        logger.info(
+            "Risk settings → max_capital_fraction=%.3f | max_positions=%d | cooldown=%d min | leverage=%.2f | shorting=%s",
+            risk_config.max_capital_fraction,
+            risk_config.max_positions,
+            risk_config.cooldown_minutes,
+            getattr(risk_config, "max_trade_leverage", 1.0),
+            "yes" if risk_config.allow_shorting else "no",
+        )
+        logger.info(
+            "Entry/exit thresholds → entry=%.3f | exit=%.3f | aggressiveness=%.2f | bias=%.3f",
+            risk_config.entry_sentiment_threshold,
+            risk_config.exit_sentiment_threshold,
+            getattr(risk_config, "aggressiveness", 1.0),
+            getattr(risk_config, "entry_signal_bias", 0.0),
+        )
+
+        cycle_interval = cycle_pause_seconds if cycle_pause_seconds and cycle_pause_seconds > 0 else 300
+
         trader_config = TraderV5Config(
             tickers=list(config_params.training.tickers),
             lookback_days=config_params.training.lookback_days,
@@ -170,7 +279,7 @@ def run_live_trading(predictor):
             gdelt_timeline_minutes=config_params.training.timeline_minutes,
             gdelt_delay=config_params.data.gdelt_pause_seconds,
             sentiment_window_minutes=config_params.training.timeline_minutes,
-            cycle_pause_seconds=300,
+            cycle_pause_seconds=cycle_interval,
             risk=risk_config,
             label_horizon_minutes=config_params.training.label_horizon_minutes,
             positive_threshold=config_params.training.positive_threshold,
@@ -191,9 +300,21 @@ def run_live_trading(predictor):
         # Verify connection
         account = alpaca_client.get_account()
         logger.info(f"Connected to Alpaca account: {account.account_number}")
-        logger.info(f"Equity: ${float(account.equity):,.2f}")
-        logger.info(f"Cash: ${float(account.cash):,.2f}")
-        
+        equity_value = float(account.equity)
+        cash_value = float(account.cash)
+        logger.info(f"Equity: ${equity_value:,.2f}")
+        logger.info(f"Cash: ${cash_value:,.2f}")
+        if expected_equity is not None:
+            try:
+                expected_equity_value = float(expected_equity)
+            except (TypeError, ValueError):
+                logger.warning("Invalid expected_equity=%r provided; skipping comparison", expected_equity)
+            else:
+                delta = equity_value - expected_equity_value
+                logger.info(
+                    f"Target equity baseline: ${expected_equity_value:,.2f} (Δ {delta:+,.2f})",
+                )
+
         clock = alpaca_client.get_clock()
         logger.info(f"Market is {'OPEN' if clock.is_open else 'CLOSED'}")
         
@@ -379,7 +500,7 @@ def run_live_trading(predictor):
                         if tone_source == "articles" and article_count > len(article_tones):
                             logger.info("   ⚠️ Some articles are missing tone data in the GDELT response")
                         if tone_source == "timeline" and article_count > 0:
-                            logger.info("   ⚠️ GDELT response omitted per-article tone; using timeline averages")
+                            logger.info("   ℹ️ GDELT omitted per-article tone; falling back to timeline averages")
                         logger.info(f"   ⏱️  Timeline Points: {timeline_points}")
                         logger.info(f"   😊 Avg Sentiment ({tone_source}): {avg_sentiment:.3f}")
                         
@@ -511,64 +632,67 @@ def run_live_trading(predictor):
                 logger.info("=" * 80)
                 logger.info("")
         
-        trader = VerboseTrader(
+        if not verbose:
+            logger.info("Verbose mode disabled; using streamlined cycle logging output.")
+
+        trader_cls = VerboseTrader if verbose else ModelDrivenTrader
+        trader = trader_cls(
             config=trader_config,
             alpaca_client=alpaca_client,
             balance_fetcher=lambda: float(alpaca_client.get_account().cash),
             predictor=predictor
         )
-        
+
+        if day_trade_limit is not None:
+            try:
+                enforced_limit = max(int(day_trade_limit), 1)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid day_trade_limit=%r provided; defaulting to 3",
+                    day_trade_limit,
+                )
+                enforced_limit = 3
+            trader.trade_tracker.max_day_trades = enforced_limit
+            logger.info(
+                "Pattern day trading guard active: max %d intraday round-trips per rolling 5 trading days",
+                enforced_limit,
+            )
+
         logger.info("✅ TraderV5 initialized successfully!")
         logger.info("")
         logger.info("=" * 80)
         logger.info("🎯 LIVE TRADING MODE ACTIVE")
         logger.info("=" * 80)
         logger.info(f"📊 Trading Schedule:")
-        logger.info(f"   • Cycle Interval: {trader_config.cycle_pause_seconds // 60} minutes")
+        flat_interval = max(trader_config.cycle_pause_seconds, 180)
+        position_interval = max(flat_interval // 2, 60)
         logger.info(f"   • Trading Tickers: {', '.join(trader_config.tickers)}")
         logger.info(f"   • Lookback Period: {trader_config.lookback_days} days")
+        logger.info(f"   • Flat Check Interval: {flat_interval} seconds")
+        logger.info(f"   • Position Check Interval: {position_interval} seconds")
         logger.info("")
         logger.info("💡 The system is now running. You will see:")
         logger.info("   1. Market status checks every 30 seconds")
-        logger.info("   2. Full trading cycles every 5 minutes (when market is open)")
-        logger.info("   3. Detailed analysis for each ticker")
+        logger.info("   2. Reactive evaluations when new data or thresholds hit")
+        if verbose:
+            logger.info("   3. Verbose trade rationales via execution logs")
+        else:
+            logger.info("   3. Compact execution logs with rationale metadata")
         logger.info("")
         logger.info("Press Ctrl+C to stop gracefully")
         logger.info("=" * 80)
         logger.info("")
-        
-        # Trading loop
-        cycle_count = 0
-        last_cycle_time = datetime.utcnow() - timedelta(seconds=trader_config.cycle_pause_seconds)  # Allow first cycle immediately
-        last_status_time = datetime.utcnow()
-        status_interval = 30  # Show status every 30 seconds
-        
-        while not shutdown_requested:
-            try:
-                current_time = datetime.utcnow()
-                time_since_last = (current_time - last_cycle_time).total_seconds()
-                time_since_status = (current_time - last_status_time).total_seconds()
-                
-                # Show periodic status updates (but not before first cycle)
-                if cycle_count > 0 and time_since_status >= status_interval:
-                    next_cycle_in = max(0, trader_config.cycle_pause_seconds - time_since_last)
-                    logger.info(f"⏰ [{current_time.strftime('%H:%M:%S')}] System active - Next cycle in {int(next_cycle_in)}s | Cycles completed: {cycle_count}")
-                    last_status_time = current_time
-                
-                # Run trading cycle
-                if time_since_last >= trader_config.cycle_pause_seconds:
-                    cycle_count += 1
-                    
-                    trader.run_cycle()
-                    last_cycle_time = current_time
-                else:
-                    time.sleep(10)  # Check every 10 seconds
-                    
-            except Exception as exc:
-                logger.error(f"Error in trading cycle: {exc}")
-                logger.exception("Cycle error")
-                time.sleep(60)  # Wait before retry
-        
+
+        runner = ReactiveTraderRunner(
+            trader,
+            status_interval=60,
+            sync_interval=max(120, trader_config.cycle_pause_seconds),
+            flat_interval_seconds=flat_interval,
+            position_interval_seconds=position_interval,
+        )
+
+        runner.run_forever()
+
         logger.info("Trading stopped")
         
     except KeyboardInterrupt:
