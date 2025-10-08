@@ -60,6 +60,9 @@ class RiskSettings:
     take_profit_multiple: float
     max_drawdown_pct: float
     drawdown_size_reduction: float
+    entry_signal_bias: float = 0.0
+    aggressiveness: float = 1.0
+    max_trade_leverage: float = 1.0
 
     def __post_init__(self) -> None:
         if not (0.0 < self.risk_per_trade_pct < 0.05):
@@ -72,6 +75,12 @@ class RiskSettings:
             raise ValueError("risk.max_drawdown_pct must be between 0 and 0.5")
         if not (0.0 < self.drawdown_size_reduction <= 1.0):
             raise ValueError("risk.drawdown_size_reduction must be within (0, 1]")
+        if self.entry_signal_bias < 0:
+            raise ValueError("risk.entry_signal_bias must be non-negative")
+        if self.aggressiveness <= 0:
+            raise ValueError("risk.aggressiveness must be positive")
+        if self.max_trade_leverage <= 0:
+            raise ValueError("risk.max_trade_leverage must be positive")
 
 
 @dataclass(frozen=True)
@@ -240,6 +249,9 @@ def _build_settings(raw: Mapping[str, Any]) -> TradingParameters:
         take_profit_multiple=float(risk_raw.get("take_profit_multiple", 2.5)),
         max_drawdown_pct=float(risk_raw.get("max_drawdown_pct", 0.06)),
         drawdown_size_reduction=float(risk_raw.get("drawdown_size_reduction", 0.5)),
+        entry_signal_bias=float(risk_raw.get("entry_signal_bias", 0.0)),
+        aggressiveness=float(risk_raw.get("aggressiveness", 1.0)),
+        max_trade_leverage=float(risk_raw.get("max_trade_leverage", 1.0)),
     )
 
     calendar = CalendarSettings(

@@ -62,6 +62,16 @@ class ModelDecisionEngine:
         signal = SignalContext(probability_long=probability, features=features)
         strength = signal.signal_strength
 
+        aggressiveness = max(0.25, float(getattr(self.risk, "aggressiveness", 1.0)))
+        entry_bias = float(getattr(self.risk, "entry_signal_bias", 0.0))
+        base_entry_threshold = max(0.0, float(self.risk.entry_sentiment_threshold) - entry_bias)
+        strength_threshold = max(0.02, min(0.35, base_entry_threshold / aggressiveness))
+
+        exit_base = max(0.0, float(self.risk.exit_sentiment_threshold) - entry_bias * 0.5)
+        exit_threshold = max(0.01, min(0.25, exit_base / max(1.0, aggressiveness * 0.7)))
+        long_exit_threshold = exit_threshold
+        short_exit_threshold = -exit_threshold
+
         pos_side, quantity, market_value = self._parse_position(position, price)
 
         available_funds, per_position_cap = self._position_budget(account, market_value)
@@ -70,7 +80,7 @@ class ModelDecisionEngine:
         score_note = {"probability_long": f"{probability:.3f}", "score": f"{strength:.3f}"}
 
         if pos_side == "LONG" and quantity > 0:
-            if strength <= self.risk.exit_sentiment_threshold:
+            if strength <= long_exit_threshold:
                 notional = market_value if market_value > 0 else quantity * price
                 return self._exit_trade(
                     ticker,
@@ -84,7 +94,7 @@ class ModelDecisionEngine:
             return self._hold(ticker, "maintain long position")
 
         if pos_side == "SHORT" and quantity > 0:
-            if strength >= -self.risk.exit_sentiment_threshold:
+            if strength >= short_exit_threshold:
                 notional = market_value if market_value > 0 else quantity * price
                 return self._exit_trade(
                     ticker,
@@ -98,7 +108,6 @@ class ModelDecisionEngine:
             return self._hold(ticker, "maintain short position")
 
         # Entry gates
-        strength_threshold = max(self.risk.entry_sentiment_threshold, 0.05)
         cooldown_active = self._cooldown_active(ticker)
         if cooldown_active:
             return self._hold(ticker, "cooldown active")
@@ -172,9 +181,19 @@ class ModelDecisionEngine:
         return available_funds, per_position_cap
 
     def _size_trade(self, available_funds: float, per_position_cap: float, strength: float) -> float:
-        base = min(available_funds, per_position_cap)
-        scaled = base * min(max(strength, 0.05), 1.0)
-        return float(scaled)
+        if per_position_cap <= 0:
+            return 0.0
+        aggressiveness = max(0.4, float(getattr(self.risk, "aggressiveness", 1.0)))
+        leverage_cap = max(0.25, float(getattr(self.risk, "max_trade_leverage", 1.0)))
+        capital_ceiling = per_position_cap * min(leverage_cap, 2.5)
+        capital_floor = max(per_position_cap, available_funds)
+        base = min(capital_ceiling, capital_floor)
+        if base <= 0:
+            return 0.0
+        conviction = max(0.0, min(1.0, strength)) ** 0.65
+        ramp = (0.78 + 0.42 * min(aggressiveness, 3.5)) * conviction + 0.08
+        position_fraction = max(0.06, min(leverage_cap, ramp))
+        return float(base * position_fraction)
 
     def _cooldown_active(self, ticker: str) -> bool:
         last_trade = self.last_trade_at.get(ticker)

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import logging
+import os
 import time
 
 import pandas as pd
@@ -25,6 +26,7 @@ class GDELTWindow:
     timeline_minutes: int
     timeline: List[Tuple[datetime, float]]
     articles: List[Dict[str, Any]]
+    summaries: List[Any]
 
 
 class YahooFinanceDataFetcher:
@@ -130,6 +132,16 @@ def collect_gdelt_window(
     delay: float = 0.75,
 ) -> GDELTWindow:
     """Fetch timeline and article slices for a ticker/time range."""
+    if os.getenv("BACKTEST_DISABLE_GDELT", "0").lower() in {"1", "true", "yes"}:
+        return GDELTWindow(
+            ticker=ticker,
+            start=start,
+            end=end,
+            timeline_minutes=timeline_minutes,
+            timeline=[],
+            articles=[],
+            summaries=[],
+        )
     client = client or GDELTClient(delay=delay)
     def _gdelt_request(params: Dict[str, str], *, attempts: int = 4) -> Dict[str, Any]:
         for attempt in range(1, attempts + 1):
@@ -138,8 +150,13 @@ def collect_gdelt_window(
             except requests.RequestException as exc:
                 wait = max(delay, 1.0) * attempt
                 if attempt == attempts:
-                    _LOG.error("GDELT request failed for %s after %s attempts: %s", ticker, attempts, exc)
-                    raise
+                    _LOG.error(
+                        "GDELT request failed for %s after %s attempts: %s",
+                        ticker,
+                        attempts,
+                        exc,
+                    )
+                    return {}
                 _LOG.warning(
                     "GDELT request failed for %s (attempt %s/%s): %s; retrying in %.1fs",
                     ticker,
@@ -161,7 +178,7 @@ def collect_gdelt_window(
             "timelineminutes": str(timeline_minutes),
         }
     )
-    timeline_raw = timeline_payload.get("timeline", [])
+    timeline_raw = (timeline_payload or {}).get("timeline", [])
     timeline: List[Tuple[datetime, float]] = []
     for series in timeline_raw:
         for point in series.get("data", []):
@@ -194,7 +211,7 @@ def collect_gdelt_window(
             "sort": "DateAsc",
         }
         payload = _gdelt_request(params)
-        articles.extend(payload.get("articles", []))
+        articles.extend((payload or {}).get("articles", []))
         chunk_start = chunk_end
         time.sleep(max(0.0, delay - 0.2))
 
@@ -205,6 +222,7 @@ def collect_gdelt_window(
         timeline_minutes=timeline_minutes,
         timeline=timeline,
         articles=articles,
+        summaries=[],
     )
 
 

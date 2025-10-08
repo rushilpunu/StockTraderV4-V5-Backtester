@@ -28,7 +28,8 @@ class BacktestMetrics:
     def win_rate(self) -> float:
         if not self.trades:
             return 0.0
-        return self.profitable_trades / len(self.trades)
+        round_trips = max(1, len(self.trades) // 2)
+        return self.profitable_trades / round_trips
 
     @property
     def max_drawdown(self) -> float:

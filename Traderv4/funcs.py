@@ -54,6 +54,9 @@ class RiskConfig:
     exit_sentiment_threshold: float = 0.05
     max_position_value: Optional[float] = None
     allow_shorting: bool = False
+    aggressiveness: float = 1.0
+    max_trade_leverage: float = 1.0
+    entry_signal_bias: float = 0.0
 
 
 @dataclass

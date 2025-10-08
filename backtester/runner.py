@@ -5,7 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import os
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Tuple
 
@@ -17,7 +17,7 @@ from .config import BacktestConfig
 from .data_sources import fetch_price_bars
 from .metrics import BacktestMetrics
 from .sentiment_features import SentimentSnapshot, build_sentiment_snapshots
-from .simulator import PortfolioSimulator
+from .simulator import ExecutedTrade, PortfolioSimulator
 from Traderv4.funcs import TradeDecision
 
 _LOG = logging.getLogger(__name__)
@@ -126,7 +126,6 @@ class BacktestRunner:
         for bot_name in bot_names:
             bot = cls._instantiate_bot(bot_name)
             simulator = PortfolioSimulator(config.starting_cash)
-            profitable = 0
             alerts = 0
             sentiment_idx = 0
             step_logs: List[Dict[str, Any]] = [] if config.record_trace else None
@@ -192,8 +191,6 @@ class BacktestRunner:
                             for kw in keywords_val.split(","):
                                 if kw:
                                     keyword_counter[kw.strip()] += 1
-                        if post_equity > pre_equity:
-                            profitable += 1
                 else:
                     simulator.step(timestamp.isoformat(), {ticker: price})
                 if step_logs is not None and len(step_logs) < 250:
@@ -245,7 +242,7 @@ class BacktestRunner:
                 total_return=simulator.realized_pnl(),
                 trades=simulator.trade_log,
                 pnl_curve=simulator.equity_curve,
-                profitable_trades=profitable,
+                profitable_trades=_count_profitable(simulator.trade_log),
                 total_alerts=alerts,
                 debug={
                     "steps": step_logs or [],
@@ -256,6 +253,34 @@ class BacktestRunner:
             )
             bot.on_cycle_end()
         return results
+
+
+def _count_profitable(trades: Iterable[ExecutedTrade]) -> int:
+    """Pair buy/sell executions to count profitable exits."""
+
+    long_entries: deque[list[float]] = deque()
+    wins = 0
+    for trade in trades:
+        if trade.action == "BUY":
+            long_entries.append([float(trade.price), float(trade.quantity)])
+            continue
+        if trade.action != "SELL":
+            continue
+        remaining = float(trade.quantity)
+        while remaining > 1e-6 and long_entries:
+            entry_price, entry_qty = long_entries[0]
+            matched = min(entry_qty, remaining)
+            pnl = (float(trade.price) - entry_price) * matched
+            if pnl > 0:
+                wins += 1
+            entry_qty -= matched
+            remaining -= matched
+            if entry_qty <= 1e-6:
+                long_entries.popleft()
+            else:
+                long_entries[0][1] = entry_qty
+    return wins
+
 
 def _run_ticker_job(config: BacktestConfig, bot_names: Iterable[str], ticker: str) -> Dict[str, BacktestMetrics]:
     return BacktestRunner._run_ticker(config, bot_names, ticker)
