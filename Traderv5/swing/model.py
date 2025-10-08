@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Mapping, MutableMapping, Sequence, Union
+from typing import Dict, Iterable, Mapping, MutableMapping, Sequence
 
 import math
 import statistics
@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 
-FeatureLike = Union[Mapping[str, float], pd.Series, np.ndarray, Sequence[float]]
+FeatureLike = Mapping[str, float] | pd.Series | np.ndarray | Sequence[float]
 
 
 @dataclass(frozen=True)

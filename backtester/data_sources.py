@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta
-from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -28,136 +27,8 @@ except Exception:  # pragma: no cover - fallback when config unavailable
 _LOG = logging.getLogger(__name__)
 _OFFLINE_MODE = os.getenv("BACKTEST_OFFLINE", "1").lower() not in {"0", "false", "no"}
 
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_DEFAULT_DATA_DIR = _REPO_ROOT / "data"
-_DEFAULT_MULTI_CSV = _DEFAULT_DATA_DIR / "stocks.csv"
-
-def _parse_env_paths(key: str) -> List[Path]:
-    raw = os.getenv(key, "").strip()
-    if not raw:
-        return []
-    paths: List[Path] = []
-    for entry in raw.split(os.pathsep):
-        entry = entry.strip()
-        if not entry:
-            continue
-        paths.append(Path(entry).expanduser().resolve())
-    return paths
-
-
-_LOCAL_CSV_FILES: List[Path] = _parse_env_paths("BACKTEST_PRICE_CSV")
-if _DEFAULT_MULTI_CSV.exists():
-    # Ensure the repository-shipped dataset is considered last so env overrides win.
-    _LOCAL_CSV_FILES.append(_DEFAULT_MULTI_CSV.resolve())
-
-
-@lru_cache(maxsize=8)
-def _load_multi_csv(path: Path) -> Dict[str, pd.DataFrame]:
-    if not path.exists() or not path.is_file():
-        return {}
-    try:
-        frame = pd.read_csv(path)
-    except Exception as exc:  # pragma: no cover - defensive guard for malformed data
-        _LOG.warning("Failed to read local CSV data at %s: %s", path, exc)
-        return {}
-    if frame.empty:
-        return {}
-
-    column_map = {col.lower(): col for col in frame.columns}
-    symbol_key = column_map.get("symbol") or column_map.get("ticker")
-    date_key = (
-        column_map.get("date")
-        or column_map.get("timestamp")
-        or column_map.get("datetime")
-    )
-    if symbol_key is None or date_key is None:
-        _LOG.warning(
-            "Local CSV %s missing symbol/date columns; available columns=%s",
-            path,
-            list(frame.columns),
-        )
-        return {}
-
-    try:
-        frame[date_key] = pd.to_datetime(frame[date_key], errors="coerce")
-    except Exception as exc:
-        _LOG.warning("Failed to parse dates for %s: %s", path, exc)
-        return {}
-    frame = frame.dropna(subset=[date_key])
-    if frame.empty:
-        return {}
-
-    ohlc_candidates = {
-        "open": ["open", "opn"],
-        "high": ["high", "hi"],
-        "low": ["low", "lo"],
-        "close": ["close", "adjclose", "adj_close", "price"],
-    }
-    volume_candidates = ["volume", "vol"]
-
-    grouped: Dict[str, pd.DataFrame] = {}
-    for symbol, group in frame.groupby(symbol_key):
-        cleaned = group.sort_values(date_key).set_index(date_key)
-        cleaned.index = pd.to_datetime(cleaned.index).tz_localize(None)
-        base = pd.DataFrame(index=cleaned.index)
-        close_series = None
-
-        for field, candidates in ohlc_candidates.items():
-            series = None
-            for candidate in candidates:
-                column = column_map.get(candidate)
-                if column and column in cleaned:
-                    series = cleaned[column].astype(float)
-                    break
-            if series is None:
-                if field == "close" and close_series is None:
-                    continue
-                continue
-            base[field] = series
-            if field == "close":
-                close_series = series
-
-        if close_series is None:
-            # Fall back to a generic price column if available.
-            price_col = column_map.get("price")
-            if price_col and price_col in cleaned:
-                close_series = cleaned[price_col].astype(float)
-                base["close"] = close_series
-        if close_series is None or close_series.empty:
-            continue
-
-        for field in ("open", "high", "low"):
-            if field not in base or base[field].isna().all():
-                base[field] = close_series
-
-        volume_series = None
-        for candidate in volume_candidates:
-            column = column_map.get(candidate)
-            if column and column in cleaned:
-                try:
-                    volume_series = cleaned[column].astype(float)
-                except Exception:
-                    volume_series = cleaned[column].apply(pd.to_numeric, errors="coerce")
-                break
-        if volume_series is None:
-            volume_series = pd.Series(0.0, index=base.index)
-        base["volume"] = volume_series.fillna(0.0)
-
-        base = base[["open", "high", "low", "close", "volume"]]
-        base = base.astype(float)
-        grouped[str(symbol).upper()] = base
-
-    return grouped
-
-
-def _load_local_price_series(ticker: str) -> Optional[pd.DataFrame]:
-    symbol = ticker.upper()
-    for path in _LOCAL_CSV_FILES:
-        cache = _load_multi_csv(path)
-        frame = cache.get(symbol)
-        if frame is not None and not frame.empty:
-            return frame
-    return None
+_LOCAL_PRICE_FILE = Path(__file__).resolve().parents[1] / "data" / "prices" / "all_stocks_5yr_subset.csv"
+_LOCAL_PRICE_CACHE: Dict[str, pd.DataFrame] = {}
 
 
 def _alpaca_available() -> bool:
@@ -177,6 +48,55 @@ def _format_timestamp(value: datetime) -> str:
     if value.tzinfo is None:
         return value.strftime("%Y-%m-%dT%H:%M:%SZ")
     return value.astimezone().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _load_local_price_series(ticker: str) -> pd.DataFrame:
+    """Load locally cached OHLCV data for the requested ticker."""
+
+    symbol = ticker.upper()
+    cached = _LOCAL_PRICE_CACHE.get(symbol)
+    if cached is not None:
+        return cached.copy()
+
+    if not _LOCAL_PRICE_FILE.exists():
+        return pd.DataFrame()
+
+    frame = pd.read_csv(_LOCAL_PRICE_FILE)
+    if "date" not in frame.columns or "Name" not in frame.columns:
+        _LOG.warning("Local price cache is missing expected columns")
+        return pd.DataFrame()
+    frame["date"] = pd.to_datetime(frame["date"])
+    subset = frame[frame["Name"].str.upper() == symbol].copy()
+    if subset.empty:
+        return pd.DataFrame()
+
+    subset = subset.sort_values("date").set_index("date")
+    renamed = subset.rename(
+        columns={
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "volume": "volume",
+        }
+    )
+    renamed = renamed[["open", "high", "low", "close", "volume"]]
+    renamed = renamed.apply(pd.to_numeric, errors="coerce")
+    renamed = renamed.ffill().bfill()
+    _LOCAL_PRICE_CACHE[symbol] = renamed
+    return renamed.copy()
+
+
+def _slice_price_frame(df: pd.DataFrame, start: datetime, end: datetime, *, ticker: Optional[str] = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    start_norm = pd.Timestamp(start).normalize()
+    end_norm = pd.Timestamp(end).normalize()
+    window = df[(df.index >= start_norm) & (df.index <= end_norm)].copy()
+    if window.empty:
+        symbol = ticker or "<unknown>"
+        _LOG.warning("Local price cache has no data for %s between %s and %s", symbol, start, end)
+    return window
 
 
 def fetch_price_bars(
@@ -205,16 +125,19 @@ def fetch_price_bars(
         except Exception as exc:  # pragma: no cover - runtime dependency failures
             _LOG.warning("Alpaca data fetch failed for %s (%s); falling back to Yahoo", ticker, exc)
 
-    local_frame = _load_local_price_series(ticker)
-    if local_frame is not None:
-        filtered = local_frame.copy()
-        filtered = filtered[(filtered.index >= start) & (filtered.index <= end)]
-        if not filtered.empty:
-            _LOG.info("Loaded %s price bars for %s from local dataset", len(filtered), ticker)
-            return filtered
-
     if _OFFLINE_MODE:
-        return _synthetic_price_series(ticker, start, end, timeframe)
+        local = _slice_price_frame(_load_local_price_series(ticker), start, end, ticker=ticker)
+        if local.empty:
+            raise RuntimeError(
+                f"Offline mode enabled but no local price data available for {ticker}. "
+                "Please populate data/prices/all_stocks_5yr_subset.csv with real OHLCV prices."
+            )
+        if timeframe != "1Day":
+            _LOG.warning(
+                "Local price cache contains daily bars; requested timeframe %s will be approximated via daily data.",
+                timeframe,
+            )
+        return local
 
     fetcher = YahooFinanceDataFetcher()
     interval_map = {
@@ -231,111 +154,19 @@ def fetch_price_bars(
     frame = fetcher.fetch_price_history(ticker, range_=range_, interval=interval)
     if frame.empty:
         _LOG.warning("Yahoo price data request returned empty frame for %s", ticker)
-        local_frame = _load_local_price_series(ticker)
-        if local_frame is not None:
-            filtered = local_frame[(local_frame.index >= start) & (local_frame.index <= end)]
-            if not filtered.empty:
-                _LOG.info("Loaded %s price bars for %s from local dataset", len(filtered), ticker)
-                return filtered
-        return _synthetic_price_series(ticker, start, end, timeframe)
+        local = _slice_price_frame(_load_local_price_series(ticker), start, end, ticker=ticker)
+        if not local.empty:
+            return local
+        raise RuntimeError(f"No price data available for {ticker} via Yahoo or local cache")
     frame.index = pd.to_datetime(frame.index).tz_convert("UTC").tz_localize(None)
     filtered = frame[(frame.index >= start) & (frame.index <= end)].copy()
     if filtered.empty:
         _LOG.warning("Filtered Yahoo data empty for %s between %s and %s", ticker, start, end)
-        local_frame = _load_local_price_series(ticker)
-        if local_frame is not None:
-            filtered = local_frame[(local_frame.index >= start) & (local_frame.index <= end)]
-            if not filtered.empty:
-                _LOG.info("Loaded %s price bars for %s from local dataset", len(filtered), ticker)
-                return filtered
-        return _synthetic_price_series(ticker, start, end, timeframe)
+        local = _slice_price_frame(_load_local_price_series(ticker), start, end, ticker=ticker)
+        if not local.empty:
+            return local
+        raise RuntimeError(f"No price data available for {ticker} in requested window")
     return filtered
-
-
-def _synthetic_price_series(ticker: str, start: datetime, end: datetime, timeframe: str) -> pd.DataFrame:
-    """Fallback generator that approximates a realistic price random walk."""
-
-    freq_map = {
-        "1Min": "1min",
-        "5Min": "5min",
-        "15Min": "15min",
-        "30Min": "30min",
-        "1Hour": "1H",
-        "1Day": "1D",
-    }
-    freq = freq_map.get(timeframe, "1D")
-    index = pd.date_range(start=start, end=end, freq=freq)
-    if index.empty:
-        index = pd.date_range(start=start, periods=120, freq=freq)
-
-    seed = abs(hash((ticker.upper(), freq))) % (2**32)
-    rng = np.random.default_rng(seed)
-    steps = len(index)
-    if steps < 2:
-        base_price = 35.0 + (seed % 120) * 0.5
-        return pd.DataFrame(
-            {
-                "open": [base_price],
-                "high": [base_price],
-                "low": [base_price],
-                "close": [base_price],
-                "volume": [250_000],
-            },
-            index=index,
-        )
-
-    # Approximate the length of each step in trading minutes to scale drift/volatility.
-    step_minutes = max(1.0, (index[1] - index[0]).total_seconds() / 60.0)
-    trading_minutes_per_day = 390.0
-    minutes_per_year = trading_minutes_per_day * 252.0
-
-    annual_drift = 0.08  # ~8% annualised drift for equities.
-    annual_vol = 0.35    # ~35% annualised volatility.
-
-    drift_per_minute = np.log1p(annual_drift) / minutes_per_year
-    vol_per_minute = annual_vol / np.sqrt(minutes_per_year)
-
-    drift = drift_per_minute * step_minutes
-    volatility = vol_per_minute * np.sqrt(step_minutes)
-
-    base_price = 35.0 + (seed % 120) * 0.5
-    log_price = np.log(base_price)
-    log_path = [log_price]
-    mean_reversion = 0.12  # pulls the path back towards long-run drift.
-
-    for _ in range(1, steps):
-        shock = rng.normal(drift, volatility)
-        deviation = log_path[-1] - (log_price + drift * len(log_path))
-        shock -= mean_reversion * deviation * 0.01
-        log_path.append(log_path[-1] + shock)
-
-    prices_arr = np.exp(log_path)
-    prices_arr = np.clip(prices_arr, 1.0, None)
-
-    highs = prices_arr * (1.0 + rng.normal(0.002, 0.01, size=steps))
-    lows = prices_arr * (1.0 - rng.normal(0.002, 0.01, size=steps))
-    opens = prices_arr * (1.0 + rng.normal(0.0, 0.0025, size=steps))
-    volumes = np.maximum(50_000, rng.normal(250_000, 60_000, size=steps))
-
-    frame = pd.DataFrame(
-        {
-            "open": opens,
-            "high": np.maximum.reduce([highs, opens, prices_arr]),
-            "low": np.minimum.reduce([lows, opens, prices_arr]),
-            "close": prices_arr,
-            "volume": volumes,
-        },
-        index=index,
-    )
-    _LOG.info(
-        "Generated synthetic price series for %s (%d bars, drift=%.6f, vol=%.6f)",
-        ticker,
-        steps,
-        drift,
-        volatility,
-    )
-    return frame
-
 
 def fetch_gdelt_articles(
     ticker: str,
