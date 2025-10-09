@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -54,6 +55,9 @@ class RiskConfig:
     exit_sentiment_threshold: float = 0.05
     max_position_value: Optional[float] = None
     allow_shorting: bool = False
+    aggressiveness: float = 1.0
+    max_trade_leverage: float = 1.0
+    entry_signal_bias: float = 0.0
 
 
 @dataclass
@@ -705,9 +709,27 @@ class TradeExecutor:
             if decision.quantity <= 0:
                 self.log.info("Skipping trade for %s: zero quantity", decision.ticker)
                 return None
-            order_kwargs["qty"] = round(decision.quantity, 6)
+            quantity = round(decision.quantity, 6)
+            order_kwargs["qty"] = quantity
+            if not math.isclose(quantity, round(quantity), rel_tol=0.0, abs_tol=1e-6):
+                # Fractional share orders must be DAY orders when routed to Alpaca.
+                if order_kwargs.get("time_in_force", "").lower() != "day":
+                    self.log.debug(
+                        "Adjusting time_in_force to DAY for fractional qty %.6f on %s",
+                        quantity,
+                        decision.ticker,
+                    )
+                    order_kwargs["time_in_force"] = "day"
         elif decision.notional > 0:
-            order_kwargs["notional"] = round(decision.notional, 2)
+            notional = round(decision.notional, 2)
+            order_kwargs["notional"] = notional
+            if order_kwargs.get("time_in_force", "").lower() != "day":
+                self.log.debug(
+                    "Adjusting time_in_force to DAY for fractional notional %.2f on %s",
+                    notional,
+                    decision.ticker,
+                )
+                order_kwargs["time_in_force"] = "day"
         else:
             self.log.info("Skipping trade for %s: zero notional", decision.ticker)
             return None
@@ -723,6 +745,7 @@ class TradeExecutor:
             order_kwargs["stop_loss"] = {"stop_price": decision.stop_loss}
 
         try:
+            self._log_trade_intent(decision, order_kwargs)
             order = self.alpaca.submit_order(**order_kwargs)
             order_id = getattr(order, "id", None)
             if order_id is None and isinstance(order, dict):
@@ -766,6 +789,38 @@ class TradeExecutor:
             )
 
         return None
+
+    def _log_trade_intent(self, decision: TradeDecision, order_kwargs: Dict[str, Any]) -> None:
+        """Emit a structured log line that explains why a trade is being submitted."""
+
+        side = order_kwargs.get("side", decision.action).upper()
+        qty = order_kwargs.get("qty")
+        notional = order_kwargs.get("notional")
+        pieces = [
+            f"intent={decision.intent}",
+            f"confidence={decision.confidence:.3f}",
+            f"reason={decision.reason}",
+        ]
+        if qty is not None:
+            pieces.append(f"qty={qty}")
+        if notional is not None:
+            pieces.append(f"notional={notional}")
+        tif = order_kwargs.get("time_in_force")
+        if tif:
+            pieces.append(f"tif={tif.upper()}")
+        metadata = decision.metadata or {}
+        if metadata:
+            preview_items = list(metadata.items())[:8]
+            meta_repr = ", ".join(f"{key}={value}" for key, value in preview_items)
+        else:
+            meta_repr = "none"
+        self.log.info(
+            "Routing %s order for %s | %s | metadata: %s",
+            side,
+            decision.ticker,
+            ", ".join(pieces),
+            meta_repr,
+        )
 
     def sync_trade_activity(self) -> None:
         fetcher = getattr(self.alpaca, "list_activities", None)
@@ -882,6 +937,12 @@ class TradeExecutor:
                 cost_basis = float(getattr(position, "cost_basis", 0.0))
             except Exception:
                 cost_basis = None
+            try:
+                avg_entry_price = float(
+                    getattr(position, "avg_entry_price", getattr(position, "avg_price", 0.0))
+                )
+            except Exception:
+                avg_entry_price = None
             normalized.append(
                 {
                     "ticker": symbol.upper(),
@@ -889,6 +950,7 @@ class TradeExecutor:
                     "quantity": quantity,
                     "market_value": market_value,
                     "cost_basis": cost_basis,
+                    "avg_entry_price": avg_entry_price,
                 }
             )
         return normalized
