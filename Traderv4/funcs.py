@@ -50,6 +50,8 @@ class RiskConfig:
     max_positions: int = 5
     stop_loss_pct: float = 0.04
     take_profit_pct: float = 0.08
+    take_profit_tolerance: float = 0.10
+    expected_hold_minutes: int = 720
     cooldown_minutes: int = 30
     entry_sentiment_threshold: float = 0.1
     exit_sentiment_threshold: float = 0.05

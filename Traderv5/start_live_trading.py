@@ -182,18 +182,28 @@ def run_live_trading(
     logger.info("🚀 Starting live trading system...")
     
     shutdown_requested = False
-    
+    runner = None
+
     def signal_handler(signum, frame):
-        nonlocal shutdown_requested
+        nonlocal shutdown_requested, runner
         logger.info(f"Received signal {signum}, shutting down...")
         shutdown_requested = True
+        if runner is not None:
+            try:
+                runner.stop()
+            except Exception:
+                logger.debug("Runner stop request failed during signal handling", exc_info=True)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
         from Traderv5.configuration import load_trading_parameters
-        from Traderv5.trader import ModelDrivenTrader, TraderV5Config
+        from Traderv5.trader import (
+            ModelDrivenTrader,
+            ReactiveTraderRunner,
+            TraderV5Config,
+        )
         from Traderv4.funcs import RiskConfig
         from Traderv5.risk_profiles import AggressiveProfile, apply_profile, get_profile
         from Traderv5.persistence import PersistentTradeJournal
@@ -299,6 +309,10 @@ def run_live_trading(
             positive_threshold=config_params.training.positive_threshold,
             negative_threshold=config_params.training.negative_threshold,
         )
+
+        store_variant = (position_store_name or profile.name or AggressiveProfile.name)
+        position_store = PositionPersistence.for_variant(store_variant)
+        logger.info("Persistent position memory initialised at %s", position_store.path)
         
         logger.info(f"Trading {len(trader_config.tickers)} tickers: {', '.join(trader_config.tickers)}")
         
@@ -388,6 +402,8 @@ def run_live_trading(
             logger.info(f"   • Active Position Check: every {active_interval} seconds")
         logger.info(f"   • Trading Tickers: {', '.join(trader_config.tickers)}")
         logger.info(f"   • Lookback Period: {trader_config.lookback_days} days")
+        logger.info(f"   • Flat Check Interval: {flat_interval} seconds")
+        logger.info(f"   • Position Check Interval: {position_interval} seconds")
         logger.info("")
         logger.info("💡 The system reacts to:")
         logger.info("   1. New price bars from Yahoo Finance")

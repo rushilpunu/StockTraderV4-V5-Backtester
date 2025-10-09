@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 import logging
 import threading
+import time
 
 import pandas as pd
 
@@ -33,6 +34,7 @@ from Traderv4.state import (
 
 from Traderv5.data_sources import YahooFinanceDataFetcher, collect_gdelt_window
 from Traderv5.decision import ModelDecisionEngine
+from Traderv5.persistence import PositionPersistence
 from Traderv5.features import FeatureEngineer, FeatureEngineerConfig
 from Traderv5.model.predictor import ModelPredictor
 from Traderv5.persistence import PersistentTradeJournal
@@ -61,6 +63,92 @@ class TraderV5Config:
             if value and value not in normalized:
                 normalized.append(value)
         self.tickers = normalized
+
+
+@dataclass
+class TradingContext:
+    account: AccountSnapshot
+    positions_by_ticker: Dict[str, Dict[str, Any]]
+    open_positions: int
+    market_open: bool
+    market_status: Optional[MarketStatus]
+    fetched_at: datetime
+
+    def position_for(self, ticker: str) -> Optional[Dict[str, Any]]:
+        return self.positions_by_ticker.get(ticker.upper())
+
+    def register_entry(self, ticker: str, decision: TradeDecision) -> None:
+        symbol = ticker.upper()
+        action = decision.action.upper()
+        side = "LONG" if action == "BUY" else "SHORT"
+        try:
+            quantity = abs(float(decision.quantity or 0.0))
+        except (TypeError, ValueError):
+            quantity = 0.0
+        market_value = float(decision.notional)
+        cost_basis = market_value if side == "LONG" else -market_value
+        if symbol not in self.positions_by_ticker:
+            self.open_positions += 1
+        self.positions_by_ticker[symbol] = {
+            "ticker": symbol,
+            "side": side,
+            "quantity": quantity,
+            "market_value": market_value,
+            "cost_basis": cost_basis,
+        }
+
+    def register_exit(self, ticker: str) -> None:
+        symbol = ticker.upper()
+        if symbol in self.positions_by_ticker:
+            self.positions_by_ticker.pop(symbol, None)
+            self.open_positions = max(0, self.open_positions - 1)
+
+    def has_position(self, ticker: str) -> bool:
+        position = self.position_for(ticker)
+        if not position:
+            return False
+        try:
+            quantity = abs(float(position.get("quantity", 0.0)))
+        except (TypeError, ValueError):
+            quantity = 0.0
+        return quantity > 0
+
+
+@dataclass
+class TickerEvaluation:
+    ticker: str
+    decision: TradeDecision
+    order_id: Optional[str]
+    evaluated_at: datetime
+    last_bar_at: Optional[datetime]
+    price: Optional[float]
+    position_side: Optional[str]
+    position_quantity: float
+    profit_pct: Optional[float]
+    errors: List[str] = field(default_factory=list)
+
+
+@dataclass
+class TickerWatchState:
+    ticker: str
+    next_check: datetime
+    last_bar_at: Optional[datetime] = None
+    last_price: Optional[float] = None
+    last_result: Optional[TickerEvaluation] = None
+
+    def schedule_next(
+        self,
+        *,
+        now: datetime,
+        has_position: bool,
+        flat_interval: timedelta,
+        position_interval: timedelta,
+        min_interval: timedelta,
+    ) -> None:
+        interval = position_interval if has_position else flat_interval
+        if interval < min_interval:
+            interval = min_interval
+        self.next_check = now + interval
 
 
 class ModelDrivenTrader:
@@ -118,10 +206,13 @@ class ModelDrivenTrader:
         if not tickers_to_process:
             return
 
+    def _prepare_context_impl(self) -> TradingContext:
+        diagnostics_errors: List[str] = []
         try:
             self.executor.sync_trade_activity()
         except Exception as exc:  # pragma: no cover - logging only
             diagnostics_errors.append(f"sync_trade_activity:{exc}")
+            _LOG.debug("sync_trade_activity failed: %s", exc)
 
         account_snapshot = self.executor.get_account_snapshot()
         if account_snapshot.cash == 0.0 and self.balance_fetcher is not None:
@@ -140,6 +231,9 @@ class ModelDrivenTrader:
         self.logger.log_trade_frequency(self.trade_tracker)
 
         open_positions_payload = self.executor.get_open_positions()
+        if self.position_store:
+            self.position_store.reconcile(open_positions_payload)
+            self.decision_engine.sync_memory_from_store()
         positions_by_ticker: Dict[str, Dict[str, Any]] = {}
         for pos in open_positions_payload:
             key = str(
@@ -171,6 +265,269 @@ class ModelDrivenTrader:
             )
             if not market_open:
                 self.logger.log_market_closed(market_clock.get("next_open"))
+
+        context = TradingContext(
+            account=account_snapshot,
+            positions_by_ticker=positions_by_ticker,
+            open_positions=open_positions,
+            market_open=market_open,
+            market_status=market_status,
+            fetched_at=datetime.utcnow(),
+        )
+        if diagnostics_errors:
+            _LOG.debug("Context diagnostics: %s", diagnostics_errors)
+        return context
+
+    def _process_ticker_impl(
+        self,
+        ticker: str,
+        context: TradingContext,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> TickerEvaluation:
+        ticker_symbol = ticker.upper()
+        evaluation_started = datetime.utcnow()
+        errors: List[str] = []
+
+        try:
+            price_df = self._fetch_price_window(ticker_symbol, start, end)
+        except Exception as exc:
+            errors.append(f"price_fetch:{ticker_symbol}:{exc}")
+            decision = self._make_hold_decision(ticker_symbol, "price fetch failed")
+            return TickerEvaluation(
+                ticker=ticker_symbol,
+                decision=decision,
+                order_id=None,
+                evaluated_at=evaluation_started,
+                last_bar_at=None,
+                price=None,
+                position_side=None,
+                position_quantity=0.0,
+                profit_pct=None,
+                errors=errors,
+            )
+
+        if price_df.empty:
+            errors.append(f"no_price:{ticker_symbol}")
+            decision = self._make_hold_decision(ticker_symbol, "no price data")
+            return TickerEvaluation(
+                ticker=ticker_symbol,
+                decision=decision,
+                order_id=None,
+                evaluated_at=evaluation_started,
+                last_bar_at=None,
+                price=None,
+                position_side=None,
+                position_quantity=0.0,
+                profit_pct=None,
+                errors=errors,
+            )
+
+        last_index = price_df.index[-1]
+        if hasattr(last_index, "to_pydatetime"):
+            last_bar_at = last_index.to_pydatetime()
+        else:
+            last_bar_at = pd.Timestamp(last_index).to_pydatetime()
+        try:
+            last_bar_at = last_bar_at.astimezone(timezone.utc)
+        except Exception:
+            last_bar_at = last_bar_at.replace(tzinfo=timezone.utc)
+
+        try:
+            gdelt_window = collect_gdelt_window(
+                ticker_symbol,
+                start=start.replace(tzinfo=None),
+                end=end.replace(tzinfo=None),
+                timeline_minutes=self.config.gdelt_timeline_minutes,
+                delay=self.config.gdelt_delay,
+            )
+        except Exception as exc:
+            errors.append(f"gdelt:{ticker_symbol}:{exc}")
+            decision = self._make_hold_decision(ticker_symbol, "gdelt fetch failed")
+            return TickerEvaluation(
+                ticker=ticker_symbol,
+                decision=decision,
+                order_id=None,
+                evaluated_at=evaluation_started,
+                last_bar_at=last_bar_at,
+                price=float(price_df["close"].iloc[-1]),
+                position_side=None,
+                position_quantity=0.0,
+                profit_pct=None,
+                errors=errors,
+            )
+
+        feature_frame = self.feature_engineer.build_training_frame(
+            ticker_symbol,
+            price_df,
+            gdelt_window,
+            include_labels=False,
+        )
+        if feature_frame.empty:
+            errors.append(f"no_features:{ticker_symbol}")
+            decision = self._make_hold_decision(ticker_symbol, "no features available")
+            return TickerEvaluation(
+                ticker=ticker_symbol,
+                decision=decision,
+                order_id=None,
+                evaluated_at=evaluation_started,
+                last_bar_at=last_bar_at,
+                price=float(price_df["close"].iloc[-1]),
+                position_side=None,
+                position_quantity=0.0,
+                profit_pct=None,
+                errors=errors,
+            )
+
+        latest_row = feature_frame.iloc[-1]
+        feature_columns = self.feature_engineer.feature_columns(feature_frame)
+        features = latest_row[feature_columns].to_dict()
+        price_snapshot = {
+            "close": float(latest_row.get("close", price_df["close"].iloc[-1])),
+            "volume": float(
+                latest_row.get(
+                    "volume",
+                    price_df["volume"].iloc[-1] if "volume" in price_df else 0.0,
+                )
+            ),
+        }
+
+        position_ctx = context.position_for(ticker_symbol)
+        decision = self.decision_engine.decide(
+            ticker_symbol,
+            features=features,
+            price_snapshot=price_snapshot,
+            account=context.account,
+            position=position_ctx,
+            open_positions=context.open_positions,
+        )
+        self.logger.log_decision(decision)
+
+        probability = self._extract_probability(decision.metadata)
+        article_count = int(latest_row.get("article_count_60", 0))
+        self.sentiment_history.append(
+            SentimentPoint(
+                seen_at=datetime.utcnow(),
+                average_sentiment=probability,
+                sentiment_delta=probability - 0.5,
+                article_count=article_count,
+                ticker=ticker_symbol,
+            )
+        )
+
+        order_id: Optional[str] = None
+        if decision.action != "HOLD":
+            order_id = self.executor.place_trade(decision)
+            if order_id:
+                if decision.intent == "entry":
+                    context.register_entry(ticker_symbol, decision)
+                elif decision.intent == "exit":
+                    context.register_exit(ticker_symbol)
+
+        position_after = context.position_for(ticker_symbol)
+        position_side: Optional[str]
+        position_quantity: float
+        if position_after:
+            position_side = str(position_after.get("side", "")).upper()
+            try:
+                position_quantity = abs(float(position_after.get("quantity", 0.0)))
+            except (TypeError, ValueError):
+                position_quantity = 0.0
+        else:
+            position_side = None
+            position_quantity = 0.0
+
+        profit_pct = self._position_profit_pct(position_after, price_snapshot.get("close"))
+
+        return TickerEvaluation(
+            ticker=ticker_symbol,
+            decision=decision,
+            order_id=order_id,
+            evaluated_at=evaluation_started,
+            last_bar_at=last_bar_at,
+            price=price_snapshot.get("close"),
+            position_side=position_side,
+            position_quantity=position_quantity,
+            profit_pct=profit_pct,
+            errors=errors,
+        )
+
+    @staticmethod
+    def _make_hold_decision(
+        ticker: str, reason: str, metadata: Optional[Dict[str, str]] = None
+    ) -> TradeDecision:
+        return TradeDecision(
+            ticker=ticker,
+            action="HOLD",
+            confidence=0.0,
+            notional=0.0,
+            time_in_force="gtc",
+            stop_loss=None,
+            take_profit=None,
+            reason=reason,
+            intent="hold",
+            metadata=metadata or {},
+        )
+
+    @staticmethod
+    def _extract_probability(metadata: Optional[Dict[str, Any]]) -> float:
+        if not metadata:
+            return 0.5
+        candidates = [
+            metadata.get("probability_long"),
+            metadata.get("prob_long"),
+            metadata.get("signal_probability"),
+        ]
+        for value in candidates:
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.5
+
+    @staticmethod
+    def _position_profit_pct(
+        position: Optional[Dict[str, Any]], price: Optional[float]
+    ) -> Optional[float]:
+        if not position or price is None:
+            return None
+        try:
+            quantity = abs(float(position.get("quantity", 0.0)))
+        except (TypeError, ValueError):
+            return None
+        if quantity <= 0:
+            return None
+        cost_basis_raw = position.get("cost_basis")
+        try:
+            cost_basis = float(cost_basis_raw) if cost_basis_raw is not None else None
+        except (TypeError, ValueError):
+            cost_basis = None
+        if cost_basis in (None, 0.0):
+            return None
+        entry_price = abs(cost_basis) / quantity if quantity > 0 else None
+        if not entry_price or entry_price <= 0:
+            return None
+        side = str(position.get("side", "")).upper()
+        if side in {"SHORT", "SELL"}:
+            return (entry_price - price) / entry_price
+        return (price - entry_price) / entry_price
+
+    def run_cycle(self) -> None:
+        with self._lock:
+            self._run_cycle_impl()
+
+    def _run_cycle_impl(self) -> None:
+        cycle_started = datetime.utcnow()
+        diagnostics_errors: List[str] = []
+        alerts: List[AlertRecord] = []
+        decisions: List[DecisionRecord] = []
+        entries = exits = holds = 0
+        tickers_processed = 0
+
+        context = self.prepare_context(locked=True)
 
         end = datetime.utcnow().replace(tzinfo=timezone.utc)
         start = end - timedelta(days=self.config.lookback_days)
@@ -219,11 +576,10 @@ class ModelDrivenTrader:
                 position_ctx = positions_by_ticker.get(ticker)
                 decision = self.decision_engine.decide(
                     ticker,
-                    features=features,
-                    price_snapshot=price_snapshot,
-                    account=account_snapshot,
-                    position=position_ctx,
-                    open_positions=open_positions,
+                    context,
+                    start=start,
+                    end=end,
+                    locked=True,
                 )
                 self.logger.log_decision(decision)
                 decisions.append(DecisionRecord.from_decision(decision))
@@ -264,6 +620,15 @@ class ModelDrivenTrader:
                 if self.trade_memory is not None and not marked:
                     self.trade_memory.mark_evaluated(ticker)
 
+            decisions.append(DecisionRecord.from_decision(result.decision))
+            if result.decision.action == "HOLD":
+                holds += 1
+            elif result.decision.intent == "entry":
+                entries += 1
+            elif result.decision.intent == "exit":
+                exits += 1
+            diagnostics_errors.extend(result.errors)
+
         cycle_completed = datetime.utcnow()
         diagnostics = CycleDiagnostics(
             started_at=cycle_started,
@@ -280,9 +645,9 @@ class ModelDrivenTrader:
             alerts=alerts,
             decisions=decisions,
             sentiment_history=self.sentiment_history[-300:],
-            positions=self._serialize_positions(open_positions_payload),
+            positions=self._serialize_positions(list(context.positions_by_ticker.values())),
             day_trade=self._day_trade_status(),
-            market_status=market_status,
+            market_status=context.market_status,
             diagnostics=diagnostics,
         )
         if self.trade_memory is not None:
@@ -355,4 +720,156 @@ class ModelDrivenTrader:
         return DayTradeStatus(used=used, limit=self.trade_tracker.max_day_trades, next_reset=next_reset)
 
 
-__all__ = ["ModelDrivenTrader", "TraderV5Config"]
+class ReactiveTraderRunner:
+    def __init__(
+        self,
+        trader: ModelDrivenTrader,
+        *,
+        status_interval: int = 90,
+        sync_interval: int = 180,
+        flat_interval_seconds: Optional[int] = None,
+        position_interval_seconds: Optional[int] = None,
+    ) -> None:
+        self.trader = trader
+        self.logger = logging.getLogger("traderv5.reactive")
+        self.status_interval = max(30, int(status_interval))
+        self.sync_interval = max(60, int(sync_interval))
+        base_interval = self._resolve_interval_seconds(trader.config.price_interval)
+        flat_seconds = (
+            flat_interval_seconds
+            if flat_interval_seconds is not None
+            else max(base_interval // 2, 180)
+        )
+        position_seconds = (
+            position_interval_seconds
+            if position_interval_seconds is not None
+            else max(base_interval // 4, 90)
+        )
+        self.flat_interval = timedelta(seconds=flat_seconds)
+        self.position_interval = timedelta(seconds=position_seconds)
+        self.min_interval = timedelta(seconds=45)
+        self._stop = threading.Event()
+        now = datetime.utcnow()
+        self._watchers: Dict[str, TickerWatchState] = {
+            ticker: TickerWatchState(ticker=ticker, next_check=now)
+            for ticker in trader.config.tickers
+        }
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run_forever(self) -> None:
+        status_deadline = datetime.utcnow() + timedelta(seconds=self.status_interval)
+        next_sync = datetime.utcnow()
+        while not self._stop.is_set():
+            now = datetime.utcnow()
+            if now >= next_sync:
+                try:
+                    self.trader.executor.sync_trade_activity()
+                except Exception as exc:  # pragma: no cover - diagnostics only
+                    self.logger.debug("activity sync failed: %s", exc)
+                next_sync = now + timedelta(seconds=self.sync_interval)
+
+            due_tickers = [
+                ticker
+                for ticker, state in self._watchers.items()
+                if now >= state.next_check
+            ]
+
+            if not due_tickers:
+                sleep_until = min(
+                    (state.next_check for state in self._watchers.values()),
+                    default=now + self.flat_interval,
+                )
+                wait_seconds = max(
+                    1.0,
+                    min(60.0, (sleep_until - now).total_seconds()),
+                )
+                self._stop.wait(timeout=wait_seconds)
+                continue
+
+            context = self.trader.prepare_context()
+            if not context.market_open:
+                next_open = (
+                    context.market_status.next_open
+                    if context.market_status and context.market_status.next_open
+                    else None
+                )
+                resume = (
+                    next_open - timedelta(minutes=5)
+                    if next_open
+                    else datetime.utcnow() + timedelta(minutes=15)
+                )
+                for state in self._watchers.values():
+                    if resume > state.next_check:
+                        state.next_check = resume
+                self._stop.wait(timeout=60)
+                continue
+
+            end = datetime.utcnow().replace(tzinfo=timezone.utc)
+            start = end - timedelta(days=self.trader.config.lookback_days)
+
+            for ticker in due_tickers:
+                if self._stop.is_set():
+                    break
+                result = self.trader.process_ticker(
+                    ticker,
+                    context,
+                    start=start,
+                    end=end,
+                )
+                state = self._watchers[ticker]
+                state.last_bar_at = result.last_bar_at
+                state.last_price = result.price
+                state.last_result = result
+                has_position = (
+                    result.position_side in {"LONG", "SHORT"}
+                    and result.position_quantity > 0
+                )
+                state.schedule_next(
+                    now=datetime.utcnow(),
+                    has_position=has_position,
+                    flat_interval=self.flat_interval,
+                    position_interval=self.position_interval,
+                    min_interval=self.min_interval,
+                )
+
+            if self._stop.is_set():
+                break
+
+            if datetime.utcnow() >= status_deadline:
+                summary = ", ".join(
+                    f"{ticker}:{int(max(0, (state.next_check - datetime.utcnow()).total_seconds()))}s"
+                    for ticker, state in self._watchers.items()
+                )
+                self.logger.info("Reactive loop active | next checks %s", summary)
+                status_deadline = datetime.utcnow() + timedelta(seconds=self.status_interval)
+
+        self.logger.info("Reactive loop stopped")
+
+    @staticmethod
+    def _resolve_interval_seconds(interval: str) -> int:
+        if not interval:
+            return 300
+        text = interval.strip().lower()
+        digits = "".join(ch for ch in text if ch.isdigit())
+        try:
+            value = int(digits) if digits else 1
+        except ValueError:
+            value = 1
+        if text.endswith("m"):
+            return max(60, value * 60)
+        if text.endswith("h"):
+            return max(3600, value * 3600)
+        if text.endswith("d"):
+            return max(86400, value * 86400)
+        return max(60, value * 60)
+
+
+__all__ = [
+    "ModelDrivenTrader",
+    "TraderV5Config",
+    "ReactiveTraderRunner",
+    "TradingContext",
+    "TickerEvaluation",
+]

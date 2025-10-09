@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import math
 
@@ -27,6 +27,14 @@ class SignalContext:
     @property
     def signal_strength(self) -> float:
         return float(self.probability_long - 0.5)
+
+
+@dataclass(frozen=True)
+class ExitPlan:
+    target_price: float
+    stop_price: Optional[float]
+    tolerance: float
+    expected_exit: Optional[datetime]
 
 
 class ModelDecisionEngine:
@@ -334,6 +342,16 @@ class ModelDecisionEngine:
                 ),
                 metadata={**base_metadata, "position_notional": f"{notional:.2f}"},
             )
+            if decision.quantity:
+                self._remember_entry(
+                    ticker,
+                    side="LONG",
+                    quantity=decision.quantity,
+                    entry_price=price,
+                    plan=plan,
+                    strength=strength,
+                )
+            return decision
 
         if strength <= -strength_threshold and self.risk.allow_shorting:
             failing = [name for name, ok in short_gates.items() if not ok]
@@ -366,7 +384,9 @@ class ModelDecisionEngine:
 
         return self._hold(ticker, "signal below threshold", metadata=dict(base_metadata))
 
-    def _parse_position(self, position: Optional[Dict[str, Any]], price: float) -> tuple[str, float, float]:
+    def _parse_position(
+        self, position: Optional[Dict[str, Any]], price: float
+    ) -> tuple[str, float, float, Optional[float], Optional[float]]:
         if not position:
             return "FLAT", 0.0, 0.0
         quantity_raw = (
@@ -393,7 +413,10 @@ class ModelDecisionEngine:
             side = "SHORT"
         else:
             side = "LONG"
-        return side, quantity, market_value
+        entry_price = None
+        if quantity > 0 and cost_basis not in (None, 0):
+            entry_price = abs(cost_basis) / quantity
+        return side, quantity, market_value, entry_price, cost_basis
 
     def _position_budget(self, account: AccountSnapshot, market_value: float) -> tuple[float, float]:
         equity = account.equity or account.portfolio_value or account.cash
@@ -457,18 +480,36 @@ class ModelDecisionEngine:
         if notional <= 0:
             return self._hold(ticker, "invalid notional")
         quantity = notional / price if price > 0 else None
+        stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.0)))
+        take_profit_pct = max(0.0, float(getattr(self.risk, "take_profit_pct", 0.0)))
+
+        take_profit_price: Optional[float]
+        stop_loss_price: Optional[float]
+        if action.upper() == "BUY":
+            take_profit_price = price * (1 + take_profit_pct) if take_profit_pct > 0 else None
+            stop_loss_price = price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
+        else:
+            take_profit_price = price * (1 - take_profit_pct) if take_profit_pct > 0 else None
+            stop_loss_price = price * (1 + stop_loss_pct) if stop_loss_pct > 0 else None
+
+        metadata = metadata or {}
+        if take_profit_price:
+            metadata = {**metadata, "take_profit_price": f"{take_profit_price:.4f}"}
+        if stop_loss_price:
+            metadata = {**metadata, "stop_loss_price": f"{stop_loss_price:.4f}"}
+
         decision = TradeDecision(
             ticker=ticker,
             action=action,
             confidence=float(min(max(confidence, 0.0), 1.0)),
             notional=float(notional),
             time_in_force="gtc",
-            stop_loss=None,
-            take_profit=None,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
             reason=reason,
             intent="entry",
             quantity=quantity,
-            metadata=metadata or {},
+            metadata=metadata,
         )
         self.last_trade_at[ticker] = datetime.utcnow()
         if self.trade_memory is not None:

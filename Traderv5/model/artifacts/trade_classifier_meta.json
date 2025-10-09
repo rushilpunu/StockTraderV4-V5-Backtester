@@ -31,15 +31,18 @@
     -1,
     1
   ],
-  "trained_at": 1759289002.0266612,
-  "estimator": "logreg",
-  "scores": {
-    "histgb": 0.5286491116978438,
-    "rf": 0.5328229395821643,
-    "logreg": 0.5419442565173245
-  },
-  "roc_auc": 0.574051711232615,
-  "samples": 1684,
-  "feature_count": 26,
-  "training_type": "price_only"
+  "trained_at": 1759790792.19562,
+  "estimator": "logreg_csv",
+  "split_date": "2007-01-01T00:00:00",
+  "tickers": [
+    "AAPL",
+    "MSFT",
+    "AMZN",
+    "GOOG"
+  ],
+  "train_size": 274,
+  "test_size": 149,
+  "accuracy": 0.47651006711409394,
+  "precision": 0.5777777777777777,
+  "recall": 0.5652173913043478
 }
