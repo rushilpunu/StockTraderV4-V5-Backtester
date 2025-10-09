@@ -33,6 +33,7 @@ from Traderv4.state import (
 
 from Traderv5.data_sources import YahooFinanceDataFetcher, collect_gdelt_window
 from Traderv5.decision import ModelDecisionEngine
+from Traderv5.persistence import PositionPersistence
 from Traderv5.features import FeatureEngineer, FeatureEngineerConfig
 from Traderv5.model.predictor import ModelPredictor
 
@@ -74,6 +75,7 @@ class ModelDrivenTrader:
         predictor: Optional[ModelPredictor] = None,
         state_store: Optional[StateStore] = None,
         feature_config: Optional[FeatureEngineerConfig] = None,
+        position_store: Optional[PositionPersistence] = None,
     ) -> None:
         self.config = config
         self.yahoo_intraday = YahooFinanceClient()
@@ -90,8 +92,15 @@ class ModelDrivenTrader:
         self.executor = TradeExecutor(alpaca_client, self.trade_tracker)
         self.logger = EventLogger()
         self.state_store = state_store or StateStore()
+        self.position_store = position_store or PositionPersistence.for_variant("core")
         self.balance_fetcher = balance_fetcher
-        self.decision_engine = ModelDecisionEngine(self.predictor, config.risk, self.trade_tracker)
+        self.decision_engine = ModelDecisionEngine(
+            self.predictor,
+            config.risk,
+            self.trade_tracker,
+            position_store=self.position_store,
+        )
+        self.decision_engine.sync_memory_from_store()
         self._lock = threading.Lock()
         self.sentiment_history: List[SentimentPoint] = []
 
@@ -129,6 +138,9 @@ class ModelDrivenTrader:
         self.logger.log_trade_frequency(self.trade_tracker)
 
         open_positions_payload = self.executor.get_open_positions()
+        if self.position_store:
+            self.position_store.reconcile(open_positions_payload)
+            self.decision_engine.sync_memory_from_store()
         positions_by_ticker: Dict[str, Dict[str, Any]] = {}
         for pos in open_positions_payload:
             key = str(pos.get("ticker", "")).upper()
@@ -136,6 +148,7 @@ class ModelDrivenTrader:
                 continue
             positions_by_ticker[key] = pos
         open_positions = len(positions_by_ticker)
+        self.decision_engine.trim_memory(positions_by_ticker.keys())
 
         market_clock = self.executor.get_market_clock()
         market_open = True

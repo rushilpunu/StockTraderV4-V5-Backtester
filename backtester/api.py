@@ -51,6 +51,16 @@ async def run_backtest(payload: Dict) -> Dict:
             use_keybert=bool(payload.get("useKeybert", False)),
             record_trace=bool(payload.get("includeTrace", False)),
             max_workers=parsed_workers,
+            risk_profile=str(payload.get("riskProfile", "balanced")),
+            aggressiveness=(
+                float(payload["aggressiveness"]) if payload.get("aggressiveness") is not None else None
+            ),
+            entry_signal_bias=(
+                float(payload["entrySignalBias"]) if payload.get("entrySignalBias") is not None else None
+            ),
+            max_trade_leverage=(
+                float(payload["maxTradeLeverage"]) if payload.get("maxTradeLeverage") is not None else None
+            ),
         )
     except Exception as exc:  # pragma: no cover
         raise HTTPException(status_code=400, detail=f"Invalid payload: {exc}") from exc

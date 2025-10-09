@@ -24,6 +24,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-vader", action="store_true", help="Disable VADER sentiment")
     parser.add_argument("--trace", action="store_true", help="Record a detailed execution trace")
     parser.add_argument("--workers", type=int, default=0, help="Parallel worker processes (0 = auto)")
+    parser.add_argument(
+        "--risk-profile",
+        default="balanced",
+        choices=["baseline", "balanced", "aggressive", "swing"],
+        help="Risk profile preset to apply",
+    )
+    parser.add_argument(
+        "--aggressiveness",
+        type=float,
+        default=None,
+        help="Override aggressiveness multiplier for the selected profile",
+    )
+    parser.add_argument(
+        "--bias",
+        type=float,
+        default=None,
+        dest="entry_signal_bias",
+        help="Override entry signal bias boost",
+    )
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        default=None,
+        dest="max_trade_leverage",
+        help="Override maximum per-trade leverage",
+    )
     return parser.parse_args()
 
 
@@ -42,6 +68,10 @@ def main() -> None:
         use_keybert=args.keybert,
         record_trace=args.trace,
         max_workers=args.workers or None,
+        risk_profile=args.risk_profile,
+        aggressiveness=args.aggressiveness,
+        entry_signal_bias=args.entry_signal_bias,
+        max_trade_leverage=args.max_trade_leverage,
     )
     runner = BacktestRunner(config)
     results = runner.run()
