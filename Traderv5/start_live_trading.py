@@ -162,18 +162,28 @@ def run_live_trading(
     logger.info("🚀 Starting live trading system...")
     
     shutdown_requested = False
-    
+    runner = None
+
     def signal_handler(signum, frame):
-        nonlocal shutdown_requested
+        nonlocal shutdown_requested, runner
         logger.info(f"Received signal {signum}, shutting down...")
         shutdown_requested = True
+        if runner is not None:
+            try:
+                runner.stop()
+            except Exception:
+                logger.debug("Runner stop request failed during signal handling", exc_info=True)
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
     try:
         from Traderv5.configuration import load_trading_parameters
-        from Traderv5.trader import ModelDrivenTrader, TraderV5Config
+        from Traderv5.trader import (
+            ModelDrivenTrader,
+            ReactiveTraderRunner,
+            TraderV5Config,
+        )
         from Traderv4.funcs import RiskConfig
         from Traderv5.risk_profiles import AggressiveProfile, apply_profile, get_profile
         from config.credentials import load_alpaca_credentials
@@ -662,9 +672,12 @@ def run_live_trading(
         logger.info("🎯 LIVE TRADING MODE ACTIVE")
         logger.info("=" * 80)
         logger.info(f"📊 Trading Schedule:")
-        logger.info(f"   • Cycle Interval: {trader_config.cycle_pause_seconds // 60} minutes")
+        flat_interval = max(trader_config.cycle_pause_seconds, 180)
+        position_interval = max(flat_interval // 2, 60)
         logger.info(f"   • Trading Tickers: {', '.join(trader_config.tickers)}")
         logger.info(f"   • Lookback Period: {trader_config.lookback_days} days")
+        logger.info(f"   • Flat Check Interval: {flat_interval} seconds")
+        logger.info(f"   • Position Check Interval: {position_interval} seconds")
         logger.info("")
         logger.info("💡 The system is now running. You will see:")
         logger.info("   1. Market status checks every 30 seconds")
@@ -676,43 +689,26 @@ def run_live_trading(
             logger.info("   3. Detailed analysis for each ticker")
         else:
             logger.info("   3. Summary trade execution logs per cycle")
+        logger.info("   2. Reactive evaluations when new data or thresholds hit")
+        if verbose:
+            logger.info("   3. Verbose trade rationales via execution logs")
+        else:
+            logger.info("   3. Compact execution logs with rationale metadata")
         logger.info("")
         logger.info("Press Ctrl+C to stop gracefully")
         logger.info("=" * 80)
         logger.info("")
-        
-        # Trading loop
-        cycle_count = 0
-        last_cycle_time = datetime.utcnow() - timedelta(seconds=trader_config.cycle_pause_seconds)  # Allow first cycle immediately
-        last_status_time = datetime.utcnow()
-        status_interval = 30  # Show status every 30 seconds
-        
-        while not shutdown_requested:
-            try:
-                current_time = datetime.utcnow()
-                time_since_last = (current_time - last_cycle_time).total_seconds()
-                time_since_status = (current_time - last_status_time).total_seconds()
-                
-                # Show periodic status updates (but not before first cycle)
-                if cycle_count > 0 and time_since_status >= status_interval:
-                    next_cycle_in = max(0, trader_config.cycle_pause_seconds - time_since_last)
-                    logger.info(f"⏰ [{current_time.strftime('%H:%M:%S')}] System active - Next cycle in {int(next_cycle_in)}s | Cycles completed: {cycle_count}")
-                    last_status_time = current_time
-                
-                # Run trading cycle
-                if time_since_last >= trader_config.cycle_pause_seconds:
-                    cycle_count += 1
-                    
-                    trader.run_cycle()
-                    last_cycle_time = current_time
-                else:
-                    time.sleep(10)  # Check every 10 seconds
-                    
-            except Exception as exc:
-                logger.error(f"Error in trading cycle: {exc}")
-                logger.exception("Cycle error")
-                time.sleep(60)  # Wait before retry
-        
+
+        runner = ReactiveTraderRunner(
+            trader,
+            status_interval=60,
+            sync_interval=max(120, trader_config.cycle_pause_seconds),
+            flat_interval_seconds=flat_interval,
+            position_interval_seconds=position_interval,
+        )
+
+        runner.run_forever()
+
         logger.info("Trading stopped")
         
     except KeyboardInterrupt:

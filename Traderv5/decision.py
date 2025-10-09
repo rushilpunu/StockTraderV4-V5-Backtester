@@ -95,6 +95,13 @@ class ModelDecisionEngine:
         memory = self._memory_for(ticker)
         if position and memory:
             self._sync_memory_with_broker(ticker, memory, position, price)
+        (
+            pos_side,
+            quantity,
+            market_value,
+            entry_price,
+            position_cost,
+        ) = self._parse_position(position, price)
 
         available_funds, per_position_cap = self._position_budget(account, market_value)
 
@@ -189,6 +196,24 @@ class ModelDecisionEngine:
             ),
         }
 
+        if quantity > 0:
+            base_metadata.update(
+                {
+                    "position_side": pos_side,
+                    "position_quantity": f"{quantity:.4f}",
+                    "position_market_value": f"{market_value:.2f}",
+                }
+            )
+            if entry_price and entry_price > 0:
+                base_metadata["position_entry_price"] = f"{entry_price:.4f}"
+                if pos_side == "LONG":
+                    profit_pct = (price - entry_price) / entry_price
+                else:
+                    profit_pct = (entry_price - price) / entry_price
+                base_metadata["position_profit_pct"] = f"{profit_pct:.4f}"
+            if position_cost is not None:
+                base_metadata["position_cost_basis"] = f"{position_cost:.4f}"
+
         # Exit logic for open positions
         score_note = {
             "probability_long": base_metadata["prob_long"],
@@ -231,6 +256,182 @@ class ModelDecisionEngine:
             )
             if exit_decision:
                 return exit_decision
+
+        take_profit_pct = max(0.0, float(getattr(self.risk, "take_profit_pct", 0.0)))
+        stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.0)))
+        take_profit_tolerance = max(
+            0.0,
+            min(0.5, float(getattr(self.risk, "take_profit_tolerance", 0.1))),
+        )
+
+        if pos_side == "LONG" and quantity > 0:
+            profit_pct = None
+            if entry_price and entry_price > 0:
+                profit_pct = (price - entry_price) / entry_price
+            trigger_pct = take_profit_pct * max(0.0, 1.0 - take_profit_tolerance)
+            target_band = max(trigger_pct, take_profit_pct)
+            if (
+                take_profit_pct > 0
+                and profit_pct is not None
+                and profit_pct >= target_band
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "target_profit_pct": f"{take_profit_pct:.4f}",
+                    "trigger_pct": f"{target_band:.4f}",
+                    "long_gates": base_metadata["long_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="SELL",
+                    confidence=abs(strength) if strength != 0 else 0.75,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="target profit reached",
+                    metadata=metadata,
+                )
+            if (
+                take_profit_pct > 0
+                and profit_pct is not None
+                and profit_pct >= trigger_pct
+                and profit_pct < target_band
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "target_profit_pct": f"{take_profit_pct:.4f}",
+                    "trigger_pct": f"{trigger_pct:.4f}",
+                    "long_gates": base_metadata["long_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="SELL",
+                    confidence=abs(strength) if strength != 0 else 0.72,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="profit within target band",
+                    metadata=metadata,
+                )
+            if (
+                stop_loss_pct > 0
+                and profit_pct is not None
+                and profit_pct <= -stop_loss_pct
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "stop_loss_pct": f"{-stop_loss_pct:.4f}",
+                    "long_gates": base_metadata["long_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="SELL",
+                    confidence=abs(strength) if strength != 0 else 0.65,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="stop loss breached",
+                    metadata=metadata,
+                )
+            if strength <= long_exit_threshold:
+                notional = market_value if market_value > 0 else quantity * price
+                return self._exit_trade(
+                    ticker,
+                    action="SELL",
+                    confidence=abs(strength),
+                    notional=notional,
+                    quantity=quantity,
+                    reason="model confidence faded",
+                    metadata={**score_note, "long_gates": base_metadata["long_gates"]},
+                )
+            return self._hold(ticker, "maintain long position", metadata=dict(base_metadata))
+
+        if pos_side == "SHORT" and quantity > 0:
+            profit_pct = None
+            if entry_price and entry_price > 0:
+                profit_pct = (entry_price - price) / entry_price
+            trigger_pct = take_profit_pct * max(0.0, 1.0 - take_profit_tolerance)
+            target_band = max(trigger_pct, take_profit_pct)
+            if (
+                take_profit_pct > 0
+                and profit_pct is not None
+                and profit_pct >= target_band
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "target_profit_pct": f"{take_profit_pct:.4f}",
+                    "trigger_pct": f"{target_band:.4f}",
+                    "short_gates": base_metadata["short_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="BUY",
+                    confidence=abs(strength) if strength != 0 else 0.75,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="target profit reached",
+                    metadata=metadata,
+                )
+            if (
+                take_profit_pct > 0
+                and profit_pct is not None
+                and profit_pct >= trigger_pct
+                and profit_pct < target_band
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "target_profit_pct": f"{take_profit_pct:.4f}",
+                    "trigger_pct": f"{trigger_pct:.4f}",
+                    "short_gates": base_metadata["short_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="BUY",
+                    confidence=abs(strength) if strength != 0 else 0.72,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="profit within target band",
+                    metadata=metadata,
+                )
+            if (
+                stop_loss_pct > 0
+                and profit_pct is not None
+                and profit_pct <= -stop_loss_pct
+            ):
+                notional = market_value if market_value > 0 else quantity * price
+                metadata = {
+                    **score_note,
+                    "profit_pct": f"{profit_pct:.4f}",
+                    "stop_loss_pct": f"{-stop_loss_pct:.4f}",
+                    "short_gates": base_metadata["short_gates"],
+                }
+                return self._exit_trade(
+                    ticker,
+                    action="BUY",
+                    confidence=abs(strength) if strength != 0 else 0.65,
+                    notional=notional,
+                    quantity=quantity,
+                    reason="stop loss breached",
+                    metadata=metadata,
+                )
+            if strength >= short_exit_threshold:
+                notional = market_value if market_value > 0 else quantity * price
+                return self._exit_trade(
+                    ticker,
+                    action="BUY",
+                    confidence=abs(strength),
+                    notional=notional,
+                    quantity=quantity,
+                    reason="model confidence faded",
+                    metadata={**score_note, "short_gates": base_metadata["short_gates"]},
+                )
             return self._hold(ticker, "maintain short position", metadata=dict(base_metadata))
 
         # Entry gates
@@ -267,6 +468,7 @@ class ModelDecisionEngine:
                 "tolerance": f"{plan.tolerance:.2f}",
             }
             decision = self._enter_trade(
+            return self._enter_trade(
                 ticker,
                 action="BUY",
                 confidence=abs(strength),
@@ -277,6 +479,10 @@ class ModelDecisionEngine:
                     f" momentum={momentum:.3f}"
                 ),
                 metadata=entry_metadata,
+                    f"long conviction prob={probability:.1%}>=min={(0.5 + strength_threshold):.1%},"
+                    f" momentum={momentum:.3f}"
+                ),
+                metadata={**base_metadata, "position_notional": f"{notional:.2f}"},
             )
             if decision.quantity:
                 self._remember_entry(
@@ -314,6 +520,7 @@ class ModelDecisionEngine:
                 "tolerance": f"{plan.tolerance:.2f}",
             }
             decision = self._enter_trade(
+            return self._enter_trade(
                 ticker,
                 action="SELL",
                 confidence=abs(strength),
@@ -560,10 +767,19 @@ class ModelDecisionEngine:
             return
         refreshed = {record.ticker: record for record in self.position_store.all()}
         self._session_memory = refreshed
+                    f"short conviction prob={(1 - probability):.1%}>=min={(0.5 + strength_threshold):.1%},"
+                    f" momentum={short_momentum:.3f}"
+                ),
+                metadata={**base_metadata, "position_notional": f"{notional:.2f}"},
+            )
 
-    def _parse_position(self, position: Optional[Dict[str, Any]], price: float) -> tuple[str, float, float]:
+        return self._hold(ticker, "signal below threshold", metadata=dict(base_metadata))
+
+    def _parse_position(
+        self, position: Optional[Dict[str, Any]], price: float
+    ) -> tuple[str, float, float, Optional[float], Optional[float]]:
         if not position:
-            return "FLAT", 0.0, 0.0
+            return "FLAT", 0.0, 0.0, None, None
         try:
             quantity = abs(float(position.get("quantity", 0.0)))
         except (TypeError, ValueError):
@@ -572,16 +788,24 @@ class ModelDecisionEngine:
             market_value = abs(float(position.get("market_value", quantity * price)))
         except (TypeError, ValueError):
             market_value = quantity * price
+        cost_basis_raw = position.get("cost_basis") if isinstance(position, dict) else None
+        try:
+            cost_basis = float(cost_basis_raw) if cost_basis_raw is not None else None
+        except (TypeError, ValueError):
+            cost_basis = None
         raw_side = str(position.get("side", "")).upper()
         if quantity <= 0:
-            return "FLAT", 0.0, 0.0
+            return "FLAT", 0.0, 0.0, None, cost_basis
         if raw_side in {"LONG", "BUY"}:
             side = "LONG"
         elif raw_side in {"SHORT", "SELL"}:
             side = "SHORT"
         else:
             side = "LONG"
-        return side, quantity, market_value
+        entry_price = None
+        if quantity > 0 and cost_basis not in (None, 0):
+            entry_price = abs(cost_basis) / quantity
+        return side, quantity, market_value, entry_price, cost_basis
 
     def _position_budget(self, account: AccountSnapshot, market_value: float) -> tuple[float, float]:
         equity = account.equity or account.portfolio_value or account.cash
@@ -644,18 +868,36 @@ class ModelDecisionEngine:
         if notional <= 0:
             return self._hold(ticker, "invalid notional")
         quantity = notional / price if price > 0 else None
+        stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.0)))
+        take_profit_pct = max(0.0, float(getattr(self.risk, "take_profit_pct", 0.0)))
+
+        take_profit_price: Optional[float]
+        stop_loss_price: Optional[float]
+        if action.upper() == "BUY":
+            take_profit_price = price * (1 + take_profit_pct) if take_profit_pct > 0 else None
+            stop_loss_price = price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
+        else:
+            take_profit_price = price * (1 - take_profit_pct) if take_profit_pct > 0 else None
+            stop_loss_price = price * (1 + stop_loss_pct) if stop_loss_pct > 0 else None
+
+        metadata = metadata or {}
+        if take_profit_price:
+            metadata = {**metadata, "take_profit_price": f"{take_profit_price:.4f}"}
+        if stop_loss_price:
+            metadata = {**metadata, "stop_loss_price": f"{stop_loss_price:.4f}"}
+
         decision = TradeDecision(
             ticker=ticker,
             action=action,
             confidence=float(min(max(confidence, 0.0), 1.0)),
             notional=float(notional),
             time_in_force="gtc",
-            stop_loss=None,
-            take_profit=None,
+            stop_loss=stop_loss_price,
+            take_profit=take_profit_price,
             reason=reason,
             intent="entry",
             quantity=quantity,
-            metadata=metadata or {},
+            metadata=metadata,
         )
         self.last_trade_at[ticker] = datetime.utcnow()
         return decision

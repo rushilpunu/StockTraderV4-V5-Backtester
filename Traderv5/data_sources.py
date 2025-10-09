@@ -307,8 +307,13 @@ def collect_gdelt_window(
             except requests.RequestException as exc:
                 wait = max(delay, 1.0) * attempt
                 if attempt == attempts:
-                    _LOG.error("GDELT request failed for %s after %s attempts: %s", ticker, attempts, exc)
-                    raise
+                    _LOG.error(
+                        "GDELT request failed for %s after %s attempts: %s",
+                        ticker,
+                        attempts,
+                        exc,
+                    )
+                    return {}
                 _LOG.warning(
                     "GDELT request failed for %s (attempt %s/%s): %s; retrying in %.1fs",
                     ticker,
