@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import math
 
@@ -16,6 +16,7 @@ from Traderv4.funcs import (
 )
 
 from Traderv5.model.predictor import ModelPredictor
+from Traderv5.persistence import PositionPersistence, StoredPosition
 
 
 @dataclass
@@ -28,17 +29,28 @@ class SignalContext:
         return float(self.probability_long - 0.5)
 
 
+@dataclass(frozen=True)
+class ExitPlan:
+    target_price: float
+    stop_price: Optional[float]
+    tolerance: float
+    expected_exit: Optional[datetime]
+
+
 class ModelDecisionEngine:
     def __init__(
         self,
         predictor: ModelPredictor,
         risk: RiskConfig,
         trade_tracker: TradeFrequencyTracker,
+        position_store: Optional[PositionPersistence] = None,
     ) -> None:
         self.predictor = predictor
         self.risk = risk
         self.trade_tracker = trade_tracker
         self.last_trade_at: Dict[str, datetime] = {}
+        self.position_store = position_store
+        self._session_memory: Dict[str, StoredPosition] = {}
 
     def decide(
         self,
@@ -79,6 +91,10 @@ class ModelDecisionEngine:
         long_exit_threshold = exit_threshold
         short_exit_threshold = -exit_threshold
 
+        pos_side, quantity, market_value = self._parse_position(position, price)
+        memory = self._memory_for(ticker)
+        if position and memory:
+            self._sync_memory_with_broker(ticker, memory, position, price)
         (
             pos_side,
             quantity,
@@ -205,6 +221,41 @@ class ModelDecisionEngine:
             "momentum": base_metadata["momentum"],
             "sentiment": base_metadata["sentiment"],
         }
+
+        if pos_side == "LONG" and quantity > 0:
+            exit_decision = self._evaluate_exit(
+                ticker,
+                side="LONG",
+                quantity=quantity,
+                price=price,
+                market_value=market_value,
+                strength=strength,
+                gate_snapshot=base_metadata["long_gates"],
+                threshold=strength_threshold,
+                exit_threshold=long_exit_threshold,
+                score_note=score_note,
+                memory=memory,
+            )
+            if exit_decision:
+                return exit_decision
+            return self._hold(ticker, "maintain long position", metadata=dict(base_metadata))
+
+        if pos_side == "SHORT" and quantity > 0:
+            exit_decision = self._evaluate_exit(
+                ticker,
+                side="SHORT",
+                quantity=quantity,
+                price=price,
+                market_value=market_value,
+                strength=strength,
+                gate_snapshot=base_metadata["short_gates"],
+                threshold=strength_threshold,
+                exit_threshold=short_exit_threshold,
+                score_note=score_note,
+                memory=memory,
+            )
+            if exit_decision:
+                return exit_decision
 
         take_profit_pct = max(0.0, float(getattr(self.risk, "take_profit_pct", 0.0)))
         stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.0)))
@@ -407,6 +458,16 @@ class ModelDecisionEngine:
                 meta = dict(base_metadata)
                 meta["sizing_block"] = "notional<=0"
                 return self._hold(ticker, "insufficient capital", metadata=meta)
+            plan = self._calculate_exit_plan("LONG", price, strength)
+            entry_metadata = {
+                **base_metadata,
+                "position_notional": f"{notional:.2f}",
+                "target_price": f"{plan.target_price:.2f}",
+                "stop_price": "none" if plan.stop_price is None else f"{plan.stop_price:.2f}",
+                "exit_eta": plan.expected_exit.isoformat() if plan.expected_exit else "none",
+                "tolerance": f"{plan.tolerance:.2f}",
+            }
+            decision = self._enter_trade(
             return self._enter_trade(
                 ticker,
                 action="BUY",
@@ -414,11 +475,25 @@ class ModelDecisionEngine:
                 notional=notional,
                 price=price,
                 reason=(
+                    f"long conviction prob={probability:.1%}>=min={(0.5 + strength_threshold):.1%},",
+                    f" momentum={momentum:.3f}"
+                ),
+                metadata=entry_metadata,
                     f"long conviction prob={probability:.1%}>=min={(0.5 + strength_threshold):.1%},"
                     f" momentum={momentum:.3f}"
                 ),
                 metadata={**base_metadata, "position_notional": f"{notional:.2f}"},
             )
+            if decision.quantity:
+                self._remember_entry(
+                    ticker,
+                    side="LONG",
+                    quantity=decision.quantity,
+                    entry_price=price,
+                    plan=plan,
+                    strength=strength,
+                )
+            return decision
 
         if strength <= -strength_threshold and self.risk.allow_shorting:
             failing = [name for name, ok in short_gates.items() if not ok]
@@ -435,6 +510,16 @@ class ModelDecisionEngine:
                 meta = dict(base_metadata)
                 meta["sizing_block"] = "notional<=0"
                 return self._hold(ticker, "insufficient capital", metadata=meta)
+            plan = self._calculate_exit_plan("SHORT", price, abs(strength))
+            entry_metadata = {
+                **base_metadata,
+                "position_notional": f"{notional:.2f}",
+                "target_price": f"{plan.target_price:.2f}",
+                "stop_price": "none" if plan.stop_price is None else f"{plan.stop_price:.2f}",
+                "exit_eta": plan.expected_exit.isoformat() if plan.expected_exit else "none",
+                "tolerance": f"{plan.tolerance:.2f}",
+            }
+            decision = self._enter_trade(
             return self._enter_trade(
                 ticker,
                 action="SELL",
@@ -442,6 +527,246 @@ class ModelDecisionEngine:
                 notional=notional,
                 price=price,
                 reason=(
+                    f"short conviction prob={(1 - probability):.1%}>=min={(0.5 + strength_threshold):.1%},",
+                    f" momentum={short_momentum:.3f}"
+                ),
+                metadata=entry_metadata,
+            )
+            if decision.quantity:
+                self._remember_entry(
+                    ticker,
+                    side="SHORT",
+                    quantity=decision.quantity,
+                    entry_price=price,
+                    plan=plan,
+                    strength=abs(strength),
+                )
+            return decision
+
+        return self._hold(ticker, "signal below threshold", metadata=dict(base_metadata))
+
+    def _evaluate_exit(
+        self,
+        ticker: str,
+        *,
+        side: str,
+        quantity: float,
+        price: float,
+        market_value: float,
+        strength: float,
+        gate_snapshot: str,
+        threshold: float,
+        exit_threshold: float,
+        score_note: Dict[str, str],
+        memory: Optional[StoredPosition],
+    ) -> Optional[TradeDecision]:
+        record = memory or self._memory_for(ticker)
+        metadata: Dict[str, str] = {**score_note, "gates": gate_snapshot}
+        tolerance = self._resolve_tolerance(record)
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+        if record:
+            metadata.update(
+                {
+                    "entry_price": f"{record.entry_price:.2f}",
+                    "target_price": f"{record.target_price:.2f}",
+                    "stop_price": "none" if record.stop_price is None else f"{record.stop_price:.2f}",
+                    "tolerance": f"{tolerance:.2f}",
+                    "exit_eta": record.expected_exit.isoformat() if record.expected_exit else "none",
+                }
+            )
+
+        if record and record.pending_exit:
+            record.last_price = price
+            record.last_updated = now
+            metadata["pending_exit"] = "1"
+            self._session_memory[ticker.upper()] = record
+            if self.position_store:
+                self.position_store.touch(ticker, price=price)
+            return None
+
+        notional = market_value if market_value > 0 else quantity * price
+        trigger_reason: Optional[str] = None
+
+        if record and record.stop_price is not None:
+            if side == "LONG" and price <= record.stop_price:
+                trigger_reason = f"stop triggered {price:.2f}<=plan {record.stop_price:.2f}"
+            elif side == "SHORT" and price >= record.stop_price:
+                trigger_reason = f"stop triggered {price:.2f}>={record.stop_price:.2f}"
+
+        if trigger_reason is None and record:
+            if side == "LONG":
+                expected = max(0.0, record.target_price - record.entry_price)
+                if expected > 0:
+                    floor_price = record.entry_price + expected * (1 - tolerance)
+                    if price >= floor_price:
+                        trigger_reason = (
+                            f"target met {price:.2f}>={floor_price:.2f} (goal {record.target_price:.2f})"
+                        )
+            else:
+                expected = max(0.0, record.entry_price - record.target_price)
+                if expected > 0:
+                    ceiling_price = record.entry_price - expected * (1 - tolerance)
+                    if price <= ceiling_price:
+                        trigger_reason = (
+                            f"target met {price:.2f}<={ceiling_price:.2f} (goal {record.target_price:.2f})"
+                        )
+
+        if trigger_reason is None and record and record.expected_exit and now >= record.expected_exit:
+            if (side == "LONG" and price >= record.entry_price) or (
+                side == "SHORT" and price <= record.entry_price
+            ):
+                trigger_reason = "max hold window reached"
+
+        if trigger_reason is None:
+            if side == "LONG" and strength <= exit_threshold:
+                trigger_reason = "model confidence faded"
+            elif side == "SHORT" and strength >= exit_threshold:
+                trigger_reason = "model confidence faded"
+
+        if trigger_reason is None:
+            if record:
+                record.last_price = price
+                record.last_updated = now
+                self._session_memory[ticker.upper()] = record
+                if self.position_store:
+                    self.position_store.touch(ticker, price=price)
+            return None
+
+        action = "SELL" if side == "LONG" else "BUY"
+        confidence = abs(strength)
+        metadata["exit_reason"] = trigger_reason
+        self._mark_pending_exit(ticker, price=price, reason=trigger_reason)
+        return self._exit_trade(
+            ticker,
+            action=action,
+            confidence=confidence,
+            notional=notional,
+            quantity=quantity,
+            reason=trigger_reason,
+            metadata=metadata,
+        )
+
+    def _resolve_tolerance(self, record: Optional[StoredPosition]) -> float:
+        if record is not None and record.tolerance is not None:
+            value = float(record.tolerance)
+        else:
+            value = float(getattr(self.risk, "take_profit_tolerance", 0.1))
+        return max(0.0, min(0.9, value))
+
+    def _calculate_exit_plan(self, side: str, price: float, strength: float) -> ExitPlan:
+        take_profit_pct = max(0.005, float(getattr(self.risk, "take_profit_pct", 0.08)))
+        stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.04)))
+        tolerance = self._resolve_tolerance(None)
+        hold_minutes = int(getattr(self.risk, "expected_hold_minutes", 0) or 0)
+        if hold_minutes <= 0:
+            hold_minutes = max(self.risk.cooldown_minutes * 3, 720)
+        expected_exit = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(minutes=hold_minutes)
+
+        if side == "LONG":
+            target = price * (1 + take_profit_pct)
+            stop = price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
+        else:
+            target = price * (1 - take_profit_pct)
+            stop = price * (1 + stop_loss_pct) if stop_loss_pct > 0 else None
+
+        return ExitPlan(target_price=float(target), stop_price=stop, tolerance=tolerance, expected_exit=expected_exit)
+
+    def _remember_entry(
+        self,
+        ticker: str,
+        *,
+        side: str,
+        quantity: float,
+        entry_price: float,
+        plan: ExitPlan,
+        strength: float,
+    ) -> None:
+        record = StoredPosition(
+            ticker=ticker.upper(),
+            side=side,
+            quantity=float(quantity),
+            entry_price=float(entry_price),
+            target_price=float(plan.target_price),
+            stop_price=None if plan.stop_price is None else float(plan.stop_price),
+            entry_time=datetime.utcnow().replace(tzinfo=timezone.utc),
+            expected_exit=plan.expected_exit,
+            tolerance=plan.tolerance,
+            pending_exit=False,
+            last_price=float(entry_price),
+            last_updated=datetime.utcnow().replace(tzinfo=timezone.utc),
+            metadata={"entry_strength": f"{strength:.3f}", "variant": "model"},
+        )
+        self._session_memory[ticker.upper()] = record
+        if self.position_store:
+            self.position_store.upsert(record)
+
+    def _memory_for(self, ticker: str) -> Optional[StoredPosition]:
+        key = ticker.upper()
+        memory = self._session_memory.get(key)
+        if memory is None and self.position_store:
+            stored = self.position_store.get(key)
+            if stored:
+                self._session_memory[key] = stored
+                memory = stored
+        return memory
+
+    def _sync_memory_with_broker(
+        self,
+        ticker: str,
+        memory: StoredPosition,
+        position: Dict[str, Any],
+        price: float,
+    ) -> None:
+        key = ticker.upper()
+        changed = False
+        try:
+            quantity = abs(float(position.get("quantity", memory.quantity)))
+        except (TypeError, ValueError):
+            quantity = memory.quantity
+        if quantity != memory.quantity:
+            memory.quantity = quantity
+            changed = True
+        if price > 0:
+            memory.last_price = price
+            changed = True
+        memory.last_updated = datetime.utcnow().replace(tzinfo=timezone.utc)
+        if changed:
+            self._session_memory[key] = memory
+            if self.position_store:
+                self.position_store.upsert(memory)
+
+    def _mark_pending_exit(self, ticker: str, *, price: float, reason: str) -> None:
+        key = ticker.upper()
+        record = self._session_memory.get(key)
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        if record:
+            record.pending_exit = True
+            record.last_price = price
+            record.last_updated = now
+            record.metadata["exit_request"] = reason
+            self._session_memory[key] = record
+        if self.position_store:
+            self.position_store.mark_pending_exit(key)
+            self.position_store.touch(key, price=price)
+
+    def forget_position(self, ticker: str) -> None:
+        key = ticker.upper()
+        self._session_memory.pop(key, None)
+        if self.position_store:
+            self.position_store.remove(key)
+
+    def trim_memory(self, active_tickers: Iterable[str]) -> None:
+        active = {t.upper() for t in active_tickers}
+        for ticker in list(self._session_memory.keys()):
+            if ticker not in active:
+                self.forget_position(ticker)
+
+    def sync_memory_from_store(self) -> None:
+        if not self.position_store:
+            return
+        refreshed = {record.ticker: record for record in self.position_store.all()}
+        self._session_memory = refreshed
                     f"short conviction prob={(1 - probability):.1%}>=min={(0.5 + strength_threshold):.1%},"
                     f" momentum={short_momentum:.3f}"
                 ),

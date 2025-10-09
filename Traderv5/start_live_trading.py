@@ -10,6 +10,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Mapping, Optional
 
+from Traderv5.persistence import PositionPersistence
+
 # Add parent directory to path and change to it
 parent_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(parent_dir))
@@ -154,6 +156,7 @@ def run_live_trading(
     day_trade_limit: Optional[int] = None,
     expected_equity: Optional[float] = None,
     verbose: bool = True,
+    position_store_name: Optional[str] = None,
 ):
     """Start the live trading system."""
     logger.info("🚀 Starting live trading system...")
@@ -285,6 +288,10 @@ def run_live_trading(
             positive_threshold=config_params.training.positive_threshold,
             negative_threshold=config_params.training.negative_threshold,
         )
+
+        store_variant = (position_store_name or profile.name or AggressiveProfile.name)
+        position_store = PositionPersistence.for_variant(store_variant)
+        logger.info("Persistent position memory initialised at %s", position_store.path)
         
         logger.info(f"Trading {len(trader_config.tickers)} tickers: {', '.join(trader_config.tickers)}")
         
@@ -640,7 +647,8 @@ def run_live_trading(
             config=trader_config,
             alpaca_client=alpaca_client,
             balance_fetcher=lambda: float(alpaca_client.get_account().cash),
-            predictor=predictor
+            predictor=predictor,
+            position_store=position_store,
         )
 
         if day_trade_limit is not None:
@@ -673,6 +681,14 @@ def run_live_trading(
         logger.info("")
         logger.info("💡 The system is now running. You will see:")
         logger.info("   1. Market status checks every 30 seconds")
+        logger.info(
+            "   2. Full trading cycles every %d minutes (when market is open)",
+            max(trader_config.cycle_pause_seconds // 60, 1),
+        )
+        if verbose:
+            logger.info("   3. Detailed analysis for each ticker")
+        else:
+            logger.info("   3. Summary trade execution logs per cycle")
         logger.info("   2. Reactive evaluations when new data or thresholds hit")
         if verbose:
             logger.info("   3. Verbose trade rationales via execution logs")

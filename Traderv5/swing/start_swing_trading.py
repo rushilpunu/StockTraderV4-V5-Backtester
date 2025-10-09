@@ -44,6 +44,9 @@ SWING_RISK_OVERRIDES = {
     "leverage": SwingProfile.leverage,
     "cooldown": SwingProfile.cooldown,
     "allow_shorting": False,
+    "take_profit_pct": 0.12,
+    "take_profit_tolerance": 0.10,
+    "expected_hold_minutes": 60 * 24 * 5,
 }
 
 
@@ -82,6 +85,7 @@ def main() -> int:
             day_trade_limit=DAY_TRADE_LIMIT,
             expected_equity=EXPECTED_EQUITY,
             verbose=False,
+            position_store_name="swing",
         )
         return 0
     except KeyboardInterrupt:
