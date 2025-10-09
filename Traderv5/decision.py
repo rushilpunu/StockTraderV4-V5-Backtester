@@ -16,7 +16,7 @@ from Traderv4.funcs import (
 )
 
 from Traderv5.model.predictor import ModelPredictor
-from Traderv5.persistence import PositionPersistence, StoredPosition
+from Traderv5.persistence import PersistentTradeJournal, PositionPlan
 
 
 @dataclass
@@ -43,14 +43,13 @@ class ModelDecisionEngine:
         predictor: ModelPredictor,
         risk: RiskConfig,
         trade_tracker: TradeFrequencyTracker,
-        position_store: Optional[PositionPersistence] = None,
+        trade_memory: Optional[PersistentTradeJournal] = None,
     ) -> None:
         self.predictor = predictor
         self.risk = risk
         self.trade_tracker = trade_tracker
         self.last_trade_at: Dict[str, datetime] = {}
-        self.position_store = position_store
-        self._session_memory: Dict[str, StoredPosition] = {}
+        self.trade_memory = trade_memory
 
     def decide(
         self,
@@ -92,16 +91,16 @@ class ModelDecisionEngine:
         short_exit_threshold = -exit_threshold
 
         pos_side, quantity, market_value = self._parse_position(position, price)
-        memory = self._memory_for(ticker)
-        if position and memory:
-            self._sync_memory_with_broker(ticker, memory, position, price)
-        (
-            pos_side,
-            quantity,
-            market_value,
-            entry_price,
-            position_cost,
-        ) = self._parse_position(position, price)
+        plan: Optional[PositionPlan] = None
+        if self.trade_memory is not None:
+            if pos_side == "FLAT" and position is None:
+                # If we have no broker position we should clear any stale plan.
+                plan = self.trade_memory.plan_for(ticker)
+                if plan and plan.quantity <= 0:
+                    self.trade_memory.confirm_exit(ticker, reason="no_position")
+                    plan = None
+            else:
+                plan = self.trade_memory.plan_for(ticker)
 
         available_funds, per_position_cap = self._position_budget(account, market_value)
 
@@ -196,23 +195,15 @@ class ModelDecisionEngine:
             ),
         }
 
-        if quantity > 0:
+        if plan:
             base_metadata.update(
                 {
-                    "position_side": pos_side,
-                    "position_quantity": f"{quantity:.4f}",
-                    "position_market_value": f"{market_value:.2f}",
+                    "plan_target": f"{plan.target_price:.2f}",
+                    "plan_stop": f"{plan.stop_loss_price:.2f}",
+                    "plan_entry": f"{plan.entry_price:.2f}",
+                    "plan_side": plan.side,
                 }
             )
-            if entry_price and entry_price > 0:
-                base_metadata["position_entry_price"] = f"{entry_price:.4f}"
-                if pos_side == "LONG":
-                    profit_pct = (price - entry_price) / entry_price
-                else:
-                    profit_pct = (entry_price - price) / entry_price
-                base_metadata["position_profit_pct"] = f"{profit_pct:.4f}"
-            if position_cost is not None:
-                base_metadata["position_cost_basis"] = f"{position_cost:.4f}"
 
         # Exit logic for open positions
         score_note = {
@@ -223,119 +214,36 @@ class ModelDecisionEngine:
         }
 
         if pos_side == "LONG" and quantity > 0:
-            exit_decision = self._evaluate_exit(
-                ticker,
-                side="LONG",
-                quantity=quantity,
-                price=price,
-                market_value=market_value,
-                strength=strength,
-                gate_snapshot=base_metadata["long_gates"],
-                threshold=strength_threshold,
-                exit_threshold=long_exit_threshold,
-                score_note=score_note,
-                memory=memory,
-            )
-            if exit_decision:
-                return exit_decision
-            return self._hold(ticker, "maintain long position", metadata=dict(base_metadata))
-
-        if pos_side == "SHORT" and quantity > 0:
-            exit_decision = self._evaluate_exit(
-                ticker,
-                side="SHORT",
-                quantity=quantity,
-                price=price,
-                market_value=market_value,
-                strength=strength,
-                gate_snapshot=base_metadata["short_gates"],
-                threshold=strength_threshold,
-                exit_threshold=short_exit_threshold,
-                score_note=score_note,
-                memory=memory,
-            )
-            if exit_decision:
-                return exit_decision
-
-        take_profit_pct = max(0.0, float(getattr(self.risk, "take_profit_pct", 0.0)))
-        stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.0)))
-        take_profit_tolerance = max(
-            0.0,
-            min(0.5, float(getattr(self.risk, "take_profit_tolerance", 0.1))),
-        )
-
-        if pos_side == "LONG" and quantity > 0:
-            profit_pct = None
-            if entry_price and entry_price > 0:
-                profit_pct = (price - entry_price) / entry_price
-            trigger_pct = take_profit_pct * max(0.0, 1.0 - take_profit_tolerance)
-            target_band = max(trigger_pct, take_profit_pct)
-            if (
-                take_profit_pct > 0
-                and profit_pct is not None
-                and profit_pct >= target_band
-            ):
-                notional = market_value if market_value > 0 else quantity * price
-                metadata = {
-                    **score_note,
-                    "profit_pct": f"{profit_pct:.4f}",
-                    "target_profit_pct": f"{take_profit_pct:.4f}",
-                    "trigger_pct": f"{target_band:.4f}",
-                    "long_gates": base_metadata["long_gates"],
-                }
-                return self._exit_trade(
-                    ticker,
-                    action="SELL",
-                    confidence=abs(strength) if strength != 0 else 0.75,
-                    notional=notional,
-                    quantity=quantity,
-                    reason="target profit reached",
-                    metadata=metadata,
-                )
-            if (
-                take_profit_pct > 0
-                and profit_pct is not None
-                and profit_pct >= trigger_pct
-                and profit_pct < target_band
-            ):
-                notional = market_value if market_value > 0 else quantity * price
-                metadata = {
-                    **score_note,
-                    "profit_pct": f"{profit_pct:.4f}",
-                    "target_profit_pct": f"{take_profit_pct:.4f}",
-                    "trigger_pct": f"{trigger_pct:.4f}",
-                    "long_gates": base_metadata["long_gates"],
-                }
-                return self._exit_trade(
-                    ticker,
-                    action="SELL",
-                    confidence=abs(strength) if strength != 0 else 0.72,
-                    notional=notional,
-                    quantity=quantity,
-                    reason="profit within target band",
-                    metadata=metadata,
-                )
-            if (
-                stop_loss_pct > 0
-                and profit_pct is not None
-                and profit_pct <= -stop_loss_pct
-            ):
-                notional = market_value if market_value > 0 else quantity * price
-                metadata = {
-                    **score_note,
-                    "profit_pct": f"{profit_pct:.4f}",
-                    "stop_loss_pct": f"{-stop_loss_pct:.4f}",
-                    "long_gates": base_metadata["long_gates"],
-                }
-                return self._exit_trade(
-                    ticker,
-                    action="SELL",
-                    confidence=abs(strength) if strength != 0 else 0.65,
-                    notional=notional,
-                    quantity=quantity,
-                    reason="stop loss breached",
-                    metadata=metadata,
-                )
+            if plan:
+                if price <= plan.stop_loss_price:
+                    notional = market_value if market_value > 0 else quantity * price
+                    return self._exit_trade(
+                        ticker,
+                        action="SELL",
+                        confidence=abs(strength),
+                        notional=notional,
+                        quantity=quantity,
+                        reason="stop loss triggered",
+                        side=pos_side,
+                        price=price,
+                        metadata={**score_note, "plan": "stop"},
+                    )
+                desired = plan.target_price
+                profit_delta = max(0.0, desired - plan.entry_price)
+                min_acceptable = plan.entry_price + profit_delta * 0.9
+                if price >= desired or price >= min_acceptable:
+                    notional = market_value if market_value > 0 else quantity * price
+                    return self._exit_trade(
+                        ticker,
+                        action="SELL",
+                        confidence=max(abs(strength), 0.5),
+                        notional=notional,
+                        quantity=quantity,
+                        reason="target reached",
+                        side=pos_side,
+                        price=price,
+                        metadata={**score_note, "plan": "target"},
+                    )
             if strength <= long_exit_threshold:
                 notional = market_value if market_value > 0 else quantity * price
                 return self._exit_trade(
@@ -345,82 +253,43 @@ class ModelDecisionEngine:
                     notional=notional,
                     quantity=quantity,
                     reason="model confidence faded",
+                    side=pos_side,
+                    price=price,
                     metadata={**score_note, "long_gates": base_metadata["long_gates"]},
                 )
             return self._hold(ticker, "maintain long position", metadata=dict(base_metadata))
 
         if pos_side == "SHORT" and quantity > 0:
-            profit_pct = None
-            if entry_price and entry_price > 0:
-                profit_pct = (entry_price - price) / entry_price
-            trigger_pct = take_profit_pct * max(0.0, 1.0 - take_profit_tolerance)
-            target_band = max(trigger_pct, take_profit_pct)
-            if (
-                take_profit_pct > 0
-                and profit_pct is not None
-                and profit_pct >= target_band
-            ):
-                notional = market_value if market_value > 0 else quantity * price
-                metadata = {
-                    **score_note,
-                    "profit_pct": f"{profit_pct:.4f}",
-                    "target_profit_pct": f"{take_profit_pct:.4f}",
-                    "trigger_pct": f"{target_band:.4f}",
-                    "short_gates": base_metadata["short_gates"],
-                }
-                return self._exit_trade(
-                    ticker,
-                    action="BUY",
-                    confidence=abs(strength) if strength != 0 else 0.75,
-                    notional=notional,
-                    quantity=quantity,
-                    reason="target profit reached",
-                    metadata=metadata,
-                )
-            if (
-                take_profit_pct > 0
-                and profit_pct is not None
-                and profit_pct >= trigger_pct
-                and profit_pct < target_band
-            ):
-                notional = market_value if market_value > 0 else quantity * price
-                metadata = {
-                    **score_note,
-                    "profit_pct": f"{profit_pct:.4f}",
-                    "target_profit_pct": f"{take_profit_pct:.4f}",
-                    "trigger_pct": f"{trigger_pct:.4f}",
-                    "short_gates": base_metadata["short_gates"],
-                }
-                return self._exit_trade(
-                    ticker,
-                    action="BUY",
-                    confidence=abs(strength) if strength != 0 else 0.72,
-                    notional=notional,
-                    quantity=quantity,
-                    reason="profit within target band",
-                    metadata=metadata,
-                )
-            if (
-                stop_loss_pct > 0
-                and profit_pct is not None
-                and profit_pct <= -stop_loss_pct
-            ):
-                notional = market_value if market_value > 0 else quantity * price
-                metadata = {
-                    **score_note,
-                    "profit_pct": f"{profit_pct:.4f}",
-                    "stop_loss_pct": f"{-stop_loss_pct:.4f}",
-                    "short_gates": base_metadata["short_gates"],
-                }
-                return self._exit_trade(
-                    ticker,
-                    action="BUY",
-                    confidence=abs(strength) if strength != 0 else 0.65,
-                    notional=notional,
-                    quantity=quantity,
-                    reason="stop loss breached",
-                    metadata=metadata,
-                )
+            if plan:
+                if price >= plan.stop_loss_price:
+                    notional = market_value if market_value > 0 else quantity * price
+                    return self._exit_trade(
+                        ticker,
+                        action="BUY",
+                        confidence=abs(strength),
+                        notional=notional,
+                        quantity=quantity,
+                        reason="stop loss triggered",
+                        side=pos_side,
+                        price=price,
+                        metadata={**score_note, "plan": "stop"},
+                    )
+                desired = plan.target_price
+                profit_delta = max(0.0, plan.entry_price - desired)
+                max_acceptable = plan.entry_price - profit_delta * 0.9
+                if price <= desired or price <= max_acceptable:
+                    notional = market_value if market_value > 0 else quantity * price
+                    return self._exit_trade(
+                        ticker,
+                        action="BUY",
+                        confidence=max(abs(strength), 0.5),
+                        notional=notional,
+                        quantity=quantity,
+                        reason="target reached",
+                        side=pos_side,
+                        price=price,
+                        metadata={**score_note, "plan": "target"},
+                    )
             if strength >= short_exit_threshold:
                 notional = market_value if market_value > 0 else quantity * price
                 return self._exit_trade(
@@ -430,6 +299,8 @@ class ModelDecisionEngine:
                     notional=notional,
                     quantity=quantity,
                     reason="model confidence faded",
+                    side=pos_side,
+                    price=price,
                     metadata={**score_note, "short_gates": base_metadata["short_gates"]},
                 )
             return self._hold(ticker, "maintain short position", metadata=dict(base_metadata))
@@ -458,27 +329,14 @@ class ModelDecisionEngine:
                 meta = dict(base_metadata)
                 meta["sizing_block"] = "notional<=0"
                 return self._hold(ticker, "insufficient capital", metadata=meta)
-            plan = self._calculate_exit_plan("LONG", price, strength)
-            entry_metadata = {
-                **base_metadata,
-                "position_notional": f"{notional:.2f}",
-                "target_price": f"{plan.target_price:.2f}",
-                "stop_price": "none" if plan.stop_price is None else f"{plan.stop_price:.2f}",
-                "exit_eta": plan.expected_exit.isoformat() if plan.expected_exit else "none",
-                "tolerance": f"{plan.tolerance:.2f}",
-            }
-            decision = self._enter_trade(
             return self._enter_trade(
                 ticker,
                 action="BUY",
                 confidence=abs(strength),
                 notional=notional,
                 price=price,
+                side="LONG",
                 reason=(
-                    f"long conviction prob={probability:.1%}>=min={(0.5 + strength_threshold):.1%},",
-                    f" momentum={momentum:.3f}"
-                ),
-                metadata=entry_metadata,
                     f"long conviction prob={probability:.1%}>=min={(0.5 + strength_threshold):.1%},"
                     f" momentum={momentum:.3f}"
                 ),
@@ -510,263 +368,14 @@ class ModelDecisionEngine:
                 meta = dict(base_metadata)
                 meta["sizing_block"] = "notional<=0"
                 return self._hold(ticker, "insufficient capital", metadata=meta)
-            plan = self._calculate_exit_plan("SHORT", price, abs(strength))
-            entry_metadata = {
-                **base_metadata,
-                "position_notional": f"{notional:.2f}",
-                "target_price": f"{plan.target_price:.2f}",
-                "stop_price": "none" if plan.stop_price is None else f"{plan.stop_price:.2f}",
-                "exit_eta": plan.expected_exit.isoformat() if plan.expected_exit else "none",
-                "tolerance": f"{plan.tolerance:.2f}",
-            }
-            decision = self._enter_trade(
             return self._enter_trade(
                 ticker,
                 action="SELL",
                 confidence=abs(strength),
                 notional=notional,
                 price=price,
+                side="SHORT",
                 reason=(
-                    f"short conviction prob={(1 - probability):.1%}>=min={(0.5 + strength_threshold):.1%},",
-                    f" momentum={short_momentum:.3f}"
-                ),
-                metadata=entry_metadata,
-            )
-            if decision.quantity:
-                self._remember_entry(
-                    ticker,
-                    side="SHORT",
-                    quantity=decision.quantity,
-                    entry_price=price,
-                    plan=plan,
-                    strength=abs(strength),
-                )
-            return decision
-
-        return self._hold(ticker, "signal below threshold", metadata=dict(base_metadata))
-
-    def _evaluate_exit(
-        self,
-        ticker: str,
-        *,
-        side: str,
-        quantity: float,
-        price: float,
-        market_value: float,
-        strength: float,
-        gate_snapshot: str,
-        threshold: float,
-        exit_threshold: float,
-        score_note: Dict[str, str],
-        memory: Optional[StoredPosition],
-    ) -> Optional[TradeDecision]:
-        record = memory or self._memory_for(ticker)
-        metadata: Dict[str, str] = {**score_note, "gates": gate_snapshot}
-        tolerance = self._resolve_tolerance(record)
-        now = datetime.utcnow().replace(tzinfo=timezone.utc)
-
-        if record:
-            metadata.update(
-                {
-                    "entry_price": f"{record.entry_price:.2f}",
-                    "target_price": f"{record.target_price:.2f}",
-                    "stop_price": "none" if record.stop_price is None else f"{record.stop_price:.2f}",
-                    "tolerance": f"{tolerance:.2f}",
-                    "exit_eta": record.expected_exit.isoformat() if record.expected_exit else "none",
-                }
-            )
-
-        if record and record.pending_exit:
-            record.last_price = price
-            record.last_updated = now
-            metadata["pending_exit"] = "1"
-            self._session_memory[ticker.upper()] = record
-            if self.position_store:
-                self.position_store.touch(ticker, price=price)
-            return None
-
-        notional = market_value if market_value > 0 else quantity * price
-        trigger_reason: Optional[str] = None
-
-        if record and record.stop_price is not None:
-            if side == "LONG" and price <= record.stop_price:
-                trigger_reason = f"stop triggered {price:.2f}<=plan {record.stop_price:.2f}"
-            elif side == "SHORT" and price >= record.stop_price:
-                trigger_reason = f"stop triggered {price:.2f}>={record.stop_price:.2f}"
-
-        if trigger_reason is None and record:
-            if side == "LONG":
-                expected = max(0.0, record.target_price - record.entry_price)
-                if expected > 0:
-                    floor_price = record.entry_price + expected * (1 - tolerance)
-                    if price >= floor_price:
-                        trigger_reason = (
-                            f"target met {price:.2f}>={floor_price:.2f} (goal {record.target_price:.2f})"
-                        )
-            else:
-                expected = max(0.0, record.entry_price - record.target_price)
-                if expected > 0:
-                    ceiling_price = record.entry_price - expected * (1 - tolerance)
-                    if price <= ceiling_price:
-                        trigger_reason = (
-                            f"target met {price:.2f}<={ceiling_price:.2f} (goal {record.target_price:.2f})"
-                        )
-
-        if trigger_reason is None and record and record.expected_exit and now >= record.expected_exit:
-            if (side == "LONG" and price >= record.entry_price) or (
-                side == "SHORT" and price <= record.entry_price
-            ):
-                trigger_reason = "max hold window reached"
-
-        if trigger_reason is None:
-            if side == "LONG" and strength <= exit_threshold:
-                trigger_reason = "model confidence faded"
-            elif side == "SHORT" and strength >= exit_threshold:
-                trigger_reason = "model confidence faded"
-
-        if trigger_reason is None:
-            if record:
-                record.last_price = price
-                record.last_updated = now
-                self._session_memory[ticker.upper()] = record
-                if self.position_store:
-                    self.position_store.touch(ticker, price=price)
-            return None
-
-        action = "SELL" if side == "LONG" else "BUY"
-        confidence = abs(strength)
-        metadata["exit_reason"] = trigger_reason
-        self._mark_pending_exit(ticker, price=price, reason=trigger_reason)
-        return self._exit_trade(
-            ticker,
-            action=action,
-            confidence=confidence,
-            notional=notional,
-            quantity=quantity,
-            reason=trigger_reason,
-            metadata=metadata,
-        )
-
-    def _resolve_tolerance(self, record: Optional[StoredPosition]) -> float:
-        if record is not None and record.tolerance is not None:
-            value = float(record.tolerance)
-        else:
-            value = float(getattr(self.risk, "take_profit_tolerance", 0.1))
-        return max(0.0, min(0.9, value))
-
-    def _calculate_exit_plan(self, side: str, price: float, strength: float) -> ExitPlan:
-        take_profit_pct = max(0.005, float(getattr(self.risk, "take_profit_pct", 0.08)))
-        stop_loss_pct = max(0.0, float(getattr(self.risk, "stop_loss_pct", 0.04)))
-        tolerance = self._resolve_tolerance(None)
-        hold_minutes = int(getattr(self.risk, "expected_hold_minutes", 0) or 0)
-        if hold_minutes <= 0:
-            hold_minutes = max(self.risk.cooldown_minutes * 3, 720)
-        expected_exit = datetime.utcnow().replace(tzinfo=timezone.utc) + timedelta(minutes=hold_minutes)
-
-        if side == "LONG":
-            target = price * (1 + take_profit_pct)
-            stop = price * (1 - stop_loss_pct) if stop_loss_pct > 0 else None
-        else:
-            target = price * (1 - take_profit_pct)
-            stop = price * (1 + stop_loss_pct) if stop_loss_pct > 0 else None
-
-        return ExitPlan(target_price=float(target), stop_price=stop, tolerance=tolerance, expected_exit=expected_exit)
-
-    def _remember_entry(
-        self,
-        ticker: str,
-        *,
-        side: str,
-        quantity: float,
-        entry_price: float,
-        plan: ExitPlan,
-        strength: float,
-    ) -> None:
-        record = StoredPosition(
-            ticker=ticker.upper(),
-            side=side,
-            quantity=float(quantity),
-            entry_price=float(entry_price),
-            target_price=float(plan.target_price),
-            stop_price=None if plan.stop_price is None else float(plan.stop_price),
-            entry_time=datetime.utcnow().replace(tzinfo=timezone.utc),
-            expected_exit=plan.expected_exit,
-            tolerance=plan.tolerance,
-            pending_exit=False,
-            last_price=float(entry_price),
-            last_updated=datetime.utcnow().replace(tzinfo=timezone.utc),
-            metadata={"entry_strength": f"{strength:.3f}", "variant": "model"},
-        )
-        self._session_memory[ticker.upper()] = record
-        if self.position_store:
-            self.position_store.upsert(record)
-
-    def _memory_for(self, ticker: str) -> Optional[StoredPosition]:
-        key = ticker.upper()
-        memory = self._session_memory.get(key)
-        if memory is None and self.position_store:
-            stored = self.position_store.get(key)
-            if stored:
-                self._session_memory[key] = stored
-                memory = stored
-        return memory
-
-    def _sync_memory_with_broker(
-        self,
-        ticker: str,
-        memory: StoredPosition,
-        position: Dict[str, Any],
-        price: float,
-    ) -> None:
-        key = ticker.upper()
-        changed = False
-        try:
-            quantity = abs(float(position.get("quantity", memory.quantity)))
-        except (TypeError, ValueError):
-            quantity = memory.quantity
-        if quantity != memory.quantity:
-            memory.quantity = quantity
-            changed = True
-        if price > 0:
-            memory.last_price = price
-            changed = True
-        memory.last_updated = datetime.utcnow().replace(tzinfo=timezone.utc)
-        if changed:
-            self._session_memory[key] = memory
-            if self.position_store:
-                self.position_store.upsert(memory)
-
-    def _mark_pending_exit(self, ticker: str, *, price: float, reason: str) -> None:
-        key = ticker.upper()
-        record = self._session_memory.get(key)
-        now = datetime.utcnow().replace(tzinfo=timezone.utc)
-        if record:
-            record.pending_exit = True
-            record.last_price = price
-            record.last_updated = now
-            record.metadata["exit_request"] = reason
-            self._session_memory[key] = record
-        if self.position_store:
-            self.position_store.mark_pending_exit(key)
-            self.position_store.touch(key, price=price)
-
-    def forget_position(self, ticker: str) -> None:
-        key = ticker.upper()
-        self._session_memory.pop(key, None)
-        if self.position_store:
-            self.position_store.remove(key)
-
-    def trim_memory(self, active_tickers: Iterable[str]) -> None:
-        active = {t.upper() for t in active_tickers}
-        for ticker in list(self._session_memory.keys()):
-            if ticker not in active:
-                self.forget_position(ticker)
-
-    def sync_memory_from_store(self) -> None:
-        if not self.position_store:
-            return
-        refreshed = {record.ticker: record for record in self.position_store.all()}
-        self._session_memory = refreshed
                     f"short conviction prob={(1 - probability):.1%}>=min={(0.5 + strength_threshold):.1%},"
                     f" momentum={short_momentum:.3f}"
                 ),
@@ -779,23 +388,25 @@ class ModelDecisionEngine:
         self, position: Optional[Dict[str, Any]], price: float
     ) -> tuple[str, float, float, Optional[float], Optional[float]]:
         if not position:
-            return "FLAT", 0.0, 0.0, None, None
+            return "FLAT", 0.0, 0.0
+        quantity_raw = (
+            position.get("quantity")
+            or position.get("qty")
+            or position.get("shares")
+            or position.get("position_qty")
+        )
         try:
-            quantity = abs(float(position.get("quantity", 0.0)))
+            quantity = abs(float(quantity_raw))
         except (TypeError, ValueError):
             quantity = 0.0
+        market_raw = position.get("market_value") or position.get("marketValue")
         try:
-            market_value = abs(float(position.get("market_value", quantity * price)))
+            market_value = abs(float(market_raw)) if market_raw is not None else quantity * price
         except (TypeError, ValueError):
             market_value = quantity * price
-        cost_basis_raw = position.get("cost_basis") if isinstance(position, dict) else None
-        try:
-            cost_basis = float(cost_basis_raw) if cost_basis_raw is not None else None
-        except (TypeError, ValueError):
-            cost_basis = None
-        raw_side = str(position.get("side", "")).upper()
-        if quantity <= 0:
-            return "FLAT", 0.0, 0.0, None, cost_basis
+        raw_side = str(position.get("side") or position.get("position_side") or "").upper()
+        if quantity <= 1e-6:
+            return "FLAT", 0.0, 0.0
         if raw_side in {"LONG", "BUY"}:
             side = "LONG"
         elif raw_side in {"SHORT", "SELL"}:
@@ -862,6 +473,7 @@ class ModelDecisionEngine:
         confidence: float,
         notional: float,
         price: float,
+        side: str,
         reason: str,
         metadata: Optional[Dict[str, str]] = None,
     ) -> TradeDecision:
@@ -900,6 +512,15 @@ class ModelDecisionEngine:
             metadata=metadata,
         )
         self.last_trade_at[ticker] = datetime.utcnow()
+        if self.trade_memory is not None:
+            self.trade_memory.plan_entry(
+                ticker,
+                side=side,
+                entry_price=price,
+                quantity=quantity,
+                metadata=decision.metadata,
+                expected_return_pct=getattr(self.risk, "take_profit_pct", None),
+            )
         return decision
 
     def _exit_trade(
@@ -911,6 +532,8 @@ class ModelDecisionEngine:
         notional: float,
         quantity: float,
         reason: str,
+        side: str,
+        price: Optional[float] = None,
         metadata: Optional[Dict[str, str]] = None,
     ) -> TradeDecision:
         decision = TradeDecision(
@@ -927,6 +550,12 @@ class ModelDecisionEngine:
             metadata=metadata or {},
         )
         self.last_trade_at[ticker] = datetime.utcnow()
+        if self.trade_memory is not None:
+            self.trade_memory.confirm_exit(
+                ticker,
+                reason=reason,
+                price=price,
+            )
         return decision
 
 

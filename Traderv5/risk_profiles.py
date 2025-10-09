@@ -105,17 +105,6 @@ def apply_profile(
     risk.aggressiveness = float(values.pop("aggressiveness", profile.aggressiveness))
     risk.entry_signal_bias = float(values.pop("bias", profile.entry_bias))
     risk.max_trade_leverage = float(values.pop("leverage", profile.leverage))
-    if "take_profit_pct" in values:
-        risk.take_profit_pct = float(values.pop("take_profit_pct"))
-    risk.take_profit_tolerance = float(
-        values.pop("take_profit_tolerance", getattr(risk, "take_profit_tolerance", 0.1))
-    )
-    risk.expected_hold_minutes = int(
-        values.pop(
-            "expected_hold_minutes",
-            getattr(risk, "expected_hold_minutes", risk.cooldown_minutes * 3),
-        )
-    )
     if "allow_shorting" in values:
         risk.allow_shorting = bool(values.pop("allow_shorting"))
     return risk

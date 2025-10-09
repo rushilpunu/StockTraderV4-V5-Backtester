@@ -939,6 +939,12 @@ class TradeExecutor:
                 cost_basis = float(getattr(position, "cost_basis", 0.0))
             except Exception:
                 cost_basis = None
+            try:
+                avg_entry_price = float(
+                    getattr(position, "avg_entry_price", getattr(position, "avg_price", 0.0))
+                )
+            except Exception:
+                avg_entry_price = None
             normalized.append(
                 {
                     "ticker": symbol.upper(),
@@ -946,6 +952,7 @@ class TradeExecutor:
                     "quantity": quantity,
                     "market_value": market_value,
                     "cost_basis": cost_basis,
+                    "avg_entry_price": avg_entry_price,
                 }
             )
         return normalized

@@ -37,6 +37,7 @@ from Traderv5.decision import ModelDecisionEngine
 from Traderv5.persistence import PositionPersistence
 from Traderv5.features import FeatureEngineer, FeatureEngineerConfig
 from Traderv5.model.predictor import ModelPredictor
+from Traderv5.persistence import PersistentTradeJournal
 
 _LOG = logging.getLogger("traderv5.trader")
 
@@ -162,7 +163,7 @@ class ModelDrivenTrader:
         predictor: Optional[ModelPredictor] = None,
         state_store: Optional[StateStore] = None,
         feature_config: Optional[FeatureEngineerConfig] = None,
-        position_store: Optional[PositionPersistence] = None,
+        trade_memory: Optional[PersistentTradeJournal] = None,
     ) -> None:
         self.config = config
         self.yahoo_intraday = YahooFinanceClient()
@@ -179,37 +180,31 @@ class ModelDrivenTrader:
         self.executor = TradeExecutor(alpaca_client, self.trade_tracker)
         self.logger = EventLogger()
         self.state_store = state_store or StateStore()
-        self.position_store = position_store or PositionPersistence.for_variant("core")
+        self.trade_memory = trade_memory
         self.balance_fetcher = balance_fetcher
         self.decision_engine = ModelDecisionEngine(
             self.predictor,
             config.risk,
             self.trade_tracker,
-            position_store=self.position_store,
+            trade_memory=self.trade_memory,
         )
-        self.decision_engine.sync_memory_from_store()
         self._lock = threading.Lock()
         self.sentiment_history: List[SentimentPoint] = []
 
-    def prepare_context(self, *, locked: bool = False) -> TradingContext:
-        if locked:
-            return self._prepare_context_impl()
+    def run_cycle(self, tickers: Optional[List[str]] = None) -> None:
         with self._lock:
-            return self._prepare_context_impl()
+            self._run_cycle_impl(tickers)
 
-    def process_ticker(
-        self,
-        ticker: str,
-        context: TradingContext,
-        *,
-        start: datetime,
-        end: datetime,
-        locked: bool = False,
-    ) -> TickerEvaluation:
-        if locked:
-            return self._process_ticker_impl(ticker, context, start=start, end=end)
-        with self._lock:
-            return self._process_ticker_impl(ticker, context, start=start, end=end)
+    def _run_cycle_impl(self, tickers: Optional[List[str]] = None) -> None:
+        cycle_started = datetime.utcnow()
+        diagnostics_errors: List[str] = []
+        alerts: List[AlertRecord] = []
+        decisions: List[DecisionRecord] = []
+        entries = exits = holds = 0
+        tickers_processed = 0
+        tickers_to_process = tickers or list(self.config.tickers)
+        if not tickers_to_process:
+            return
 
     def _prepare_context_impl(self) -> TradingContext:
         diagnostics_errors: List[str] = []
@@ -241,12 +236,21 @@ class ModelDrivenTrader:
             self.decision_engine.sync_memory_from_store()
         positions_by_ticker: Dict[str, Dict[str, Any]] = {}
         for pos in open_positions_payload:
-            key = str(pos.get("ticker", "")).upper()
+            key = str(
+                pos.get("ticker")
+                or pos.get("symbol")
+                or pos.get("asset_id")
+                or pos.get("id", "")
+            ).upper()
             if not key:
                 continue
-            positions_by_ticker[key] = pos
+            payload = dict(pos)
+            if "ticker" not in payload:
+                payload["ticker"] = key
+            positions_by_ticker[key] = payload
         open_positions = len(positions_by_ticker)
-        self.decision_engine.trim_memory(positions_by_ticker.keys())
+        if self.trade_memory is not None:
+            self.trade_memory.sync_broker_positions(positions_by_ticker)
 
         market_clock = self.executor.get_market_clock()
         market_open = True
@@ -528,22 +532,93 @@ class ModelDrivenTrader:
         end = datetime.utcnow().replace(tzinfo=timezone.utc)
         start = end - timedelta(days=self.config.lookback_days)
 
-        for ticker in self.config.tickers:
-            if not context.market_open:
+        for ticker in tickers_to_process:
+            if not market_open:
                 continue
             tickers_processed += 1
+            marked = False
             try:
-                result = self.process_ticker(
+                price_df = self._fetch_price_window(ticker, start, end)
+                if price_df.empty:
+                    diagnostics_errors.append(f"no_price:{ticker}")
+                    if self.trade_memory is not None and not marked:
+                        self.trade_memory.mark_evaluated(ticker)
+                        marked = True
+                    continue
+                gdelt_window = collect_gdelt_window(
+                    ticker,
+                    start=start.replace(tzinfo=None),
+                    end=end.replace(tzinfo=None),
+                    timeline_minutes=self.config.gdelt_timeline_minutes,
+                    delay=self.config.gdelt_delay,
+                )
+                feature_frame = self.feature_engineer.build_training_frame(
+                    ticker,
+                    price_df,
+                    gdelt_window,
+                    include_labels=False,
+                )
+                if feature_frame.empty:
+                    diagnostics_errors.append(f"no_features:{ticker}")
+                    if self.trade_memory is not None and not marked:
+                        self.trade_memory.mark_evaluated(ticker)
+                        marked = True
+                    continue
+                latest_row = feature_frame.iloc[-1]
+                feature_columns = self.feature_engineer.feature_columns(feature_frame)
+                features = latest_row[feature_columns].to_dict()
+                price_snapshot = {
+                    "close": float(latest_row.get("close", price_df["close"].iloc[-1])),
+                    "volume": float(latest_row.get("volume", price_df["volume"].iloc[-1] if "volume" in price_df else 0.0)),
+                }
+                if self.trade_memory is not None:
+                    self.trade_memory.update_market_price(ticker, price_snapshot.get("close", 0.0) or 0.0)
+                position_ctx = positions_by_ticker.get(ticker)
+                decision = self.decision_engine.decide(
                     ticker,
                     context,
                     start=start,
                     end=end,
                     locked=True,
                 )
+                self.logger.log_decision(decision)
+                decisions.append(DecisionRecord.from_decision(decision))
+                metadata = decision.metadata or {}
+                probability = float(metadata.get("probability_long", features.get("probability_long", 0.5)))
+                self.sentiment_history.append(
+                    SentimentPoint(
+                        seen_at=datetime.utcnow(),
+                        average_sentiment=probability,
+                        sentiment_delta=probability - 0.5,
+                        article_count=int(latest_row.get("article_count_60", 0)),
+                        ticker=ticker,
+                    )
+                )
+                if decision.action == "HOLD":
+                    holds += 1
+                    if self.trade_memory is not None:
+                        self.trade_memory.touch(ticker)
+                        self.trade_memory.mark_evaluated(ticker)
+                        marked = True
+                    continue
+                order_id = self.executor.place_trade(decision)
+                if order_id:
+                    if decision.intent == "entry":
+                        entries += 1
+                        open_positions += 1
+                    elif decision.intent == "exit":
+                        exits += 1
+                        open_positions = max(0, open_positions - 1)
+                if self.trade_memory is not None:
+                    self.trade_memory.mark_evaluated(ticker)
+                    marked = True
             except Exception as exc:
                 diagnostics_errors.append(f"{ticker}:{exc}")
                 _LOG.exception("Cycle error for %s", ticker)
                 continue
+            finally:
+                if self.trade_memory is not None and not marked:
+                    self.trade_memory.mark_evaluated(ticker)
 
             decisions.append(DecisionRecord.from_decision(result.decision))
             if result.decision.action == "HOLD":
@@ -575,6 +650,8 @@ class ModelDrivenTrader:
             market_status=context.market_status,
             diagnostics=diagnostics,
         )
+        if self.trade_memory is not None:
+            self.trade_memory.flush()
 
     def _fetch_price_window(
         self,

@@ -2,257 +2,370 @@
 
 from __future__ import annotations
 
-import json
-import logging
-import threading
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from threading import Lock
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-_LOG = logging.getLogger("traderv5.persistence")
+import json
 
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _to_iso(dt: Optional[datetime]) -> Optional[str]:
-    if dt is None:
-        return None
-    return dt.astimezone(timezone.utc).isoformat()
+from Traderv4.funcs import RiskConfig
 
 
-def _from_iso(value: Optional[str]) -> Optional[datetime]:
+def _utcnow() -> datetime:
+    return datetime.utcnow()
+
+
+def _parse_datetime(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        _LOG.debug("Unable to parse stored datetime '%s'", value)
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
 
 
 @dataclass
-class StoredPosition:
-    """Represents the intent the model had when entering a position."""
+class PositionPlan:
+    """Persisted expectations for an open or pending position."""
 
     ticker: str
     side: str
-    quantity: float
     entry_price: float
+    quantity: float
     target_price: float
-    stop_price: Optional[float] = None
-    entry_time: datetime = field(default_factory=_utc_now)
-    expected_exit: Optional[datetime] = None
-    tolerance: float = 0.10
-    pending_exit: bool = False
-    last_price: Optional[float] = None
-    last_updated: datetime = field(default_factory=_utc_now)
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    stop_loss_price: float
+    expected_return_pct: float
+    created_at: datetime
+    last_seen: datetime
+    expected_exit_at: Optional[datetime] = None
+    metadata: Dict[str, Any] = None
 
-    def to_dict(self) -> Dict[str, Any]:
-        payload = {
-            "ticker": self.ticker,
-            "side": self.side,
-            "quantity": self.quantity,
-            "entry_price": self.entry_price,
-            "target_price": self.target_price,
-            "stop_price": self.stop_price,
-            "entry_time": _to_iso(self.entry_time),
-            "expected_exit": _to_iso(self.expected_exit),
-            "tolerance": self.tolerance,
-            "pending_exit": self.pending_exit,
-            "last_price": self.last_price,
-            "last_updated": _to_iso(self.last_updated),
-            "metadata": self.metadata,
-        }
+    def as_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["created_at"] = self.created_at.isoformat()
+        payload["last_seen"] = self.last_seen.isoformat()
+        payload["expected_exit_at"] = (
+            self.expected_exit_at.isoformat() if self.expected_exit_at else None
+        )
         return payload
 
     @classmethod
-    def from_dict(cls, payload: Mapping[str, Any]) -> "StoredPosition":
+    def from_dict(cls, data: Dict[str, Any]) -> "PositionPlan":
+        metadata = data.get("metadata") or {}
         return cls(
-            ticker=str(payload.get("ticker", "")).upper(),
-            side=str(payload.get("side", "")).upper(),
-            quantity=float(payload.get("quantity", 0.0)),
-            entry_price=float(payload.get("entry_price", 0.0)),
-            target_price=float(payload.get("target_price", 0.0)),
-            stop_price=(
-                float(payload["stop_price"])
-                if payload.get("stop_price") is not None
-                else None
-            ),
-            entry_time=_from_iso(payload.get("entry_time")) or _utc_now(),
-            expected_exit=_from_iso(payload.get("expected_exit")),
-            tolerance=float(payload.get("tolerance", 0.10)),
-            pending_exit=bool(payload.get("pending_exit", False)),
-            last_price=(
-                float(payload["last_price"])
-                if payload.get("last_price") is not None
-                else None
-            ),
-            last_updated=_from_iso(payload.get("last_updated")) or _utc_now(),
-            metadata=dict(payload.get("metadata", {})),
-        )
-
-    def copy(self) -> "StoredPosition":
-        return StoredPosition(
-            ticker=self.ticker,
-            side=self.side,
-            quantity=self.quantity,
-            entry_price=self.entry_price,
-            target_price=self.target_price,
-            stop_price=self.stop_price,
-            entry_time=self.entry_time,
-            expected_exit=self.expected_exit,
-            tolerance=self.tolerance,
-            pending_exit=self.pending_exit,
-            last_price=self.last_price,
-            last_updated=self.last_updated,
-            metadata=dict(self.metadata),
+            ticker=str(data.get("ticker", "")).upper(),
+            side=str(data.get("side", "")).upper() or "LONG",
+            entry_price=float(data.get("entry_price", 0.0)),
+            quantity=float(data.get("quantity", 0.0)),
+            target_price=float(data.get("target_price", 0.0)),
+            stop_loss_price=float(data.get("stop_loss_price", 0.0)),
+            expected_return_pct=float(data.get("expected_return_pct", 0.0)),
+            created_at=_parse_datetime(data.get("created_at")) or _utcnow(),
+            last_seen=_parse_datetime(data.get("last_seen")) or _utcnow(),
+            expected_exit_at=_parse_datetime(data.get("expected_exit_at")),
+            metadata=dict(metadata),
         )
 
 
-class PositionPersistence:
-    """Thread-safe JSON-backed persistence for position intent."""
+class PersistentTradeJournal:
+    """Durable record of open positions and evaluation cadence."""
 
-    def __init__(self, path: Path, *, autosave: bool = True) -> None:
-        self.path = path.expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.autosave = autosave
-        self._lock = threading.Lock()
-        self._positions: Dict[str, StoredPosition] = {}
+    def __init__(
+        self,
+        risk: RiskConfig,
+        *,
+        storage_path: Optional[Path] = None,
+        variant: str = "core",
+    ) -> None:
+        self.risk = risk
+        self.variant = variant
+        self.storage_path = storage_path or Path("data/state/traderv5_state.json")
+        self._lock = Lock()
+        self._plans: Dict[str, PositionPlan] = {}
+        self._last_prices: Dict[str, float] = {}
+        self._last_evaluated: Dict[str, datetime] = {}
+        self._history: List[Dict[str, Any]] = []
+        self._dirty = False
         self._load()
 
-    @classmethod
-    def for_variant(cls, name: str) -> "PositionPersistence":
-        safe = name.strip().lower().replace(" ", "_") or "core"
-        base = Path("data/state")
-        return cls(base / f"{safe}_positions.json")
-
+    # ------------------------------------------------------------------
+    # Persistence plumbing
+    # ------------------------------------------------------------------
     def _load(self) -> None:
-        if not self.path.exists():
-            return
+        path = self.storage_path
         try:
-            with self.path.open("r", encoding="utf-8") as handle:
-                raw = json.load(handle)
-        except Exception as exc:  # pragma: no cover - IO guard
-            _LOG.warning("Unable to load position store %s: %s", self.path, exc)
+            if not path.exists():
+                return
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
             return
-        if not isinstance(raw, list):
-            _LOG.warning("Unexpected payload in %s; expected list", self.path)
-            return
-        for item in raw:
+        plans = payload.get("plans", {})
+        history = payload.get("history", [])
+        last_prices = payload.get("last_prices", {})
+        last_evaluated = payload.get("last_evaluated", {})
+        now = _utcnow()
+        for ticker, data in plans.items():
+            plan = PositionPlan.from_dict(data)
+            if not plan.ticker:
+                continue
+            self._plans[plan.ticker] = plan
+        self._history = list(history)[-250:]
+        self._last_prices = {
+            str(k).upper(): float(v)
+            for k, v in last_prices.items()
+            if isinstance(v, (float, int))
+        }
+        self._last_evaluated = {
+            str(k).upper(): _parse_datetime(v) or now
+            for k, v in last_evaluated.items()
+        }
+
+    def flush(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            payload = {
+                "variant": self.variant,
+                "updated_at": _utcnow().isoformat(),
+                "plans": {ticker: plan.as_dict() for ticker, plan in self._plans.items()},
+                "history": self._history[-250:],
+                "last_prices": self._last_prices,
+                "last_evaluated": {
+                    ticker: stamp.isoformat()
+                    for ticker, stamp in self._last_evaluated.items()
+                },
+            }
+            path = self.storage_path
             try:
-                record = StoredPosition.from_dict(item)
-            except Exception as exc:  # pragma: no cover - guard
-                _LOG.debug("Skipping malformed position entry: %s", exc)
-                continue
-            if record.ticker:
-                self._positions[record.ticker] = record
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2, sort_keys=True)
+            except OSError:
+                return
+            self._dirty = False
 
-    def _save_locked(self) -> None:
-        if not self.autosave:
+    # ------------------------------------------------------------------
+    # Scheduling helpers
+    # ------------------------------------------------------------------
+    def schedule(
+        self,
+        tickers: Iterable[str],
+        *,
+        now: Optional[datetime] = None,
+        base_interval_seconds: int = 900,
+        active_interval_seconds: Optional[int] = None,
+    ) -> Tuple[List[str], int]:
+        """Return tickers that need evaluation and the next wake-up interval."""
+
+        now = now or _utcnow()
+        active_interval = max(60, active_interval_seconds or max(60, base_interval_seconds // 3))
+        due: List[str] = []
+        soonest: Optional[int] = None
+        for ticker in tickers:
+            key = str(ticker).upper()
+            plan = self._plans.get(key)
+            interval = active_interval if plan else base_interval_seconds
+            last = self._last_evaluated.get(key)
+            if last is None:
+                due.append(key)
+                continue
+            elapsed = (now - last).total_seconds()
+            if elapsed >= interval:
+                due.append(key)
+            else:
+                wait = int(max(5, interval - elapsed))
+                if soonest is None or wait < soonest:
+                    soonest = wait
+        return due, int(soonest or max(base_interval_seconds, 60))
+
+    def mark_evaluated(self, ticker: str, when: Optional[datetime] = None) -> None:
+        with self._lock:
+            self._last_evaluated[str(ticker).upper()] = when or _utcnow()
+            self._dirty = True
+
+    def update_market_price(self, ticker: str, price: float) -> None:
+        if price <= 0:
             return
-        payload = [record.to_dict() for record in self._positions.values()]
-        with self.path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-
-    def get(self, ticker: str) -> Optional[StoredPosition]:
-        key = ticker.upper()
         with self._lock:
-            record = self._positions.get(key)
-            return record.copy() if record else None
+            self._last_prices[str(ticker).upper()] = float(price)
+            self._dirty = True
 
-    def upsert(self, record: StoredPosition) -> None:
+    # ------------------------------------------------------------------
+    # Position lifecycle
+    # ------------------------------------------------------------------
+    def plan_entry(
+        self,
+        ticker: str,
+        *,
+        side: str,
+        entry_price: float,
+        quantity: Optional[float],
+        metadata: Optional[Dict[str, Any]] = None,
+        expected_return_pct: Optional[float] = None,
+    ) -> None:
+        if entry_price <= 0:
+            return
+        key = str(ticker).upper()
+        side = side.upper()
+        take_pct, stop_pct = self._target_pcts(expected_return_pct)
+        target_price, stop_price = self._project_prices(side, entry_price, take_pct, stop_pct)
         with self._lock:
-            self._positions[record.ticker] = record.copy()
-            self._save_locked()
+            existing = self._plans.get(key)
+            created_at = existing.created_at if existing else _utcnow()
+            metadata_payload: Dict[str, Any] = {}
+            if existing and existing.metadata:
+                metadata_payload.update(existing.metadata)
+            if metadata:
+                metadata_payload.update(metadata)
+            plan = PositionPlan(
+                ticker=key,
+                side=side,
+                entry_price=entry_price,
+                quantity=float(quantity) if quantity else (existing.quantity if existing else 0.0),
+                target_price=target_price,
+                stop_loss_price=stop_price,
+                expected_return_pct=take_pct,
+                created_at=created_at,
+                last_seen=_utcnow(),
+                expected_exit_at=self._expected_exit_time(created_at),
+                metadata=metadata_payload,
+            )
+            self._plans[key] = plan
+            self._dirty = True
 
-    def remove(self, ticker: str) -> None:
-        key = ticker.upper()
+    def sync_broker_positions(self, positions: Dict[str, Dict[str, Any]]) -> None:
+        now = _utcnow()
+        seen: set[str] = set()
         with self._lock:
-            if key in self._positions:
-                del self._positions[key]
-                self._save_locked()
-
-    def all(self) -> List[StoredPosition]:
-        with self._lock:
-            return [item.copy() for item in self._positions.values()]
-
-    def mark_pending_exit(self, ticker: str) -> None:
-        key = ticker.upper()
-        with self._lock:
-            record = self._positions.get(key)
-            if record is None:
-                return
-            record.pending_exit = True
-            record.last_updated = _utc_now()
-            self._positions[key] = record
-            self._save_locked()
-
-    def touch(self, ticker: str, *, price: Optional[float] = None) -> None:
-        key = ticker.upper()
-        with self._lock:
-            record = self._positions.get(key)
-            if record is None:
-                return
-            if price is not None:
-                record.last_price = price
-            record.last_updated = _utc_now()
-            self._positions[key] = record
-            self._save_locked()
-
-    def reconcile(self, broker_positions: Iterable[Mapping[str, Any]]) -> None:
-        seen: Dict[str, Mapping[str, Any]] = {}
-        for payload in broker_positions:
-            ticker_raw = payload.get("ticker") or payload.get("symbol")
-            if not ticker_raw:
-                continue
-            key = str(ticker_raw).upper()
-            seen[key] = payload
-
-        with self._lock:
-            now = _utc_now()
-            for ticker, payload in seen.items():
-                record = self._positions.get(ticker)
-                if record is None:
-                    continue
-                try:
-                    record.quantity = float(payload.get("quantity", record.quantity))
-                except Exception:
-                    pass
-                side_raw = payload.get("side")
-                if side_raw:
-                    record.side = str(side_raw).upper()
-                price_raw = payload.get("current_price") or payload.get("market_price")
-                if price_raw is None:
-                    market_value = payload.get("market_value")
-                    qty = record.quantity or payload.get("quantity")
-                    try:
-                        qty_f = float(qty)
-                        if qty_f:
-                            price_raw = float(market_value) / qty_f
-                    except Exception:
-                        price_raw = None
-                if price_raw is not None:
-                    try:
-                        record.last_price = float(price_raw)
-                    except Exception:
-                        record.last_price = record.last_price
-                record.pending_exit = record.pending_exit and record.quantity > 0
-                record.last_updated = now
-                self._positions[ticker] = record
-
-            for ticker in list(self._positions.keys()):
+            for raw_ticker, payload in positions.items():
+                key = str(raw_ticker).upper()
+                seen.add(key)
+                qty = self._extract_float(payload, "qty", "quantity")
+                side = str(payload.get("side", "")).upper() or "LONG"
+                entry_price = self._extract_float(payload, "avg_entry_price", "avg_price")
+                if entry_price <= 0 and qty > 0:
+                    market_value = self._extract_float(payload, "market_value")
+                    if market_value > 0:
+                        entry_price = market_value / max(qty, 1e-6)
+                take_pct, stop_pct = self._target_pcts()
+                target_price, stop_price = self._project_prices(side, entry_price, take_pct, stop_pct)
+                plan = self._plans.get(key)
+                if plan is None:
+                    plan = PositionPlan(
+                        ticker=key,
+                        side=side,
+                        entry_price=entry_price,
+                        quantity=qty,
+                        target_price=target_price,
+                        stop_loss_price=stop_price,
+                        expected_return_pct=take_pct,
+                        created_at=now,
+                        last_seen=now,
+                        expected_exit_at=self._expected_exit_time(now),
+                        metadata={},
+                    )
+                    self._plans[key] = plan
+                else:
+                    plan.side = side
+                    if entry_price > 0:
+                        plan.entry_price = entry_price
+                        plan.target_price, plan.stop_loss_price = self._project_prices(
+                            side, entry_price, take_pct, stop_pct
+                        )
+                    plan.quantity = qty if qty > 0 else plan.quantity
+                    plan.last_seen = now
+                self._dirty = True
+            for ticker in list(self._plans.keys()):
                 if ticker not in seen:
-                    del self._positions[ticker]
+                    plan = self._plans.pop(ticker)
+                    self._history.append(
+                        {
+                            "ticker": plan.ticker,
+                            "side": plan.side,
+                            "closed_at": now.isoformat(),
+                            "reason": "broker_position_closed",
+                        }
+                    )
+                    self._dirty = True
 
-            self._save_locked()
+    def confirm_exit(self, ticker: str, *, reason: str, price: Optional[float] = None) -> None:
+        key = str(ticker).upper()
+        with self._lock:
+            plan = self._plans.pop(key, None)
+            if plan:
+                record = {
+                    "ticker": key,
+                    "side": plan.side,
+                    "entry_price": plan.entry_price,
+                    "target_price": plan.target_price,
+                    "exit_price": price,
+                    "reason": reason,
+                    "created_at": plan.created_at.isoformat(),
+                    "closed_at": _utcnow().isoformat(),
+                }
+                self._history.append(record)
+            self._last_prices.pop(key, None)
+            self._last_evaluated.pop(key, None)
+            self._dirty = True
+
+    def touch(self, ticker: str) -> None:
+        with self._lock:
+            plan = self._plans.get(str(ticker).upper())
+            if plan:
+                plan.last_seen = _utcnow()
+                self._dirty = True
+
+    def plan_for(self, ticker: str) -> Optional[PositionPlan]:
+        return self._plans.get(str(ticker).upper())
+
+    def active_positions(self) -> int:
+        return len(self._plans)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _target_pcts(self, expected: Optional[float] = None) -> Tuple[float, float]:
+        take_pct = float(expected) if expected is not None else float(self.risk.take_profit_pct)
+        stop_pct = float(self.risk.stop_loss_pct)
+        take_pct = max(0.0025, take_pct)
+        stop_pct = max(0.0025, stop_pct)
+        return take_pct, stop_pct
+
+    def _project_prices(
+        self,
+        side: str,
+        entry_price: float,
+        take_pct: float,
+        stop_pct: float,
+    ) -> Tuple[float, float]:
+        entry_price = float(entry_price)
+        if entry_price <= 0:
+            return 0.0, 0.0
+        if side.upper() == "SHORT":
+            target = entry_price * (1.0 - take_pct)
+            stop = entry_price * (1.0 + stop_pct)
+        else:
+            target = entry_price * (1.0 + take_pct)
+            stop = entry_price * (1.0 - stop_pct)
+        return float(target), float(stop)
+
+    def _expected_exit_time(self, start: datetime) -> datetime:
+        return start + timedelta(minutes=max(int(self.risk.cooldown_minutes * 2), 60))
+
+    @staticmethod
+    def _extract_float(payload: Dict[str, Any], *keys: str) -> float:
+        for key in keys:
+            raw = payload.get(key)
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value != 0:
+                return value
+        return 0.0
 
 
-__all__ = ["StoredPosition", "PositionPersistence"]
-
+__all__ = ["PersistentTradeJournal", "PositionPlan"]
